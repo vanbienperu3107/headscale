@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/derp"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
@@ -101,8 +102,19 @@ func (b *MapResponseBuilder) WithDebugType(t debugType) *MapResponseBuilder {
 }
 
 // WithDERPMap adds the DERP map to the response.
+// If dashboard integration is configured, a per-node override is fetched and applied.
 func (b *MapResponseBuilder) WithDERPMap() *MapResponseBuilder {
-	b.resp.DERPMap = b.mapper.state.DERPMap().AsStruct()
+	base := b.mapper.state.DERPMap().AsStruct()
+
+	// Feature B: per-node DERPMap override from dashboard
+	if b.mapper.cfg.DERP.DashboardEnabled {
+		if nv, ok := b.mapper.state.GetNodeByID(b.nodeID); ok {
+			nodeKey := nv.NodeKey().String()
+			base = derp.PatchDERPMap(b.mapper.cfg.DERP, nodeKey, base)
+		}
+	}
+
+	b.resp.DERPMap = base
 	return b
 }
 

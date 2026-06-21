@@ -203,6 +203,12 @@ type DERPConfig struct {
 	UpdateFrequency                    time.Duration
 	IPv4                               string
 	IPv6                               string
+
+	// Dashboard integration — per-node DERPMap override (Feature B).
+	DashboardEnabled   bool
+	DashboardURL       string // e.g. https://dashboard.hangocthanh.io.vn
+	DashboardSecret    string // X-Headscale-Secret header value
+	DashboardTimeoutMs int    // HTTP call timeout in milliseconds (default 500)
 }
 
 type LogTailConfig struct {
@@ -303,6 +309,12 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("derp.server.stun.enabled", true)
 	viper.SetDefault("derp.server.automatically_add_embedded_derp_region", true)
 	viper.SetDefault("derp.update_frequency", "3h")
+
+	// Feature B: per-node DERPMap from dashboard
+	viper.SetDefault("derp.dashboard.enabled", false)
+	viper.SetDefault("derp.dashboard.url", "")
+	viper.SetDefault("derp.dashboard.secret", "")
+	viper.SetDefault("derp.dashboard.timeout_ms", 500)
 
 	viper.SetDefault("unix_socket", "/var/run/headscale/headscale.sock")
 	viper.SetDefault("unix_socket_permission", "0o770")
@@ -525,6 +537,11 @@ func derpConfig() DERPConfig {
 		IPv4:                               ipv4,
 		IPv6:                               ipv6,
 		AutomaticallyAddEmbeddedDerpRegion: automaticallyAddEmbeddedDerpRegion,
+		// Feature B
+		DashboardEnabled:   viper.GetBool("derp.dashboard.enabled"),
+		DashboardURL:       viper.GetString("derp.dashboard.url"),
+		DashboardSecret:    viper.GetString("derp.dashboard.secret"),
+		DashboardTimeoutMs: viper.GetInt("derp.dashboard.timeout_ms"),
 	}
 }
 
