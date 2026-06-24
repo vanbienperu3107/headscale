@@ -1,6 +1,7 @@
 package types
 
 import (
+	"strconv"
 	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
@@ -89,4 +90,13 @@ func (pak *PreAuthKey) Validate() error {
 	}
 
 	return nil
+}
+
+// StringID returns the PreAuthKey's database ID as a decimal string.
+// This is used by the v2 API which encodes 64-bit IDs as strings.
+func (v PreAuthKeyView) StringID() string {
+	if v.ж == nil {
+		return ""
+	}
+	return strconv.FormatUint(v.ж.ID, 10)
 }

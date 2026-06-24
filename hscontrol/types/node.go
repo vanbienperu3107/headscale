@@ -690,6 +690,10 @@ func (v NodeView) UserView() UserView {
 	return u.View()
 }
 
+func (v NodeView) StringID() string {
+	return v.ж.ID.String()
+}
+
 func (v NodeView) IPs() []netip.Addr {
 	if !v.Valid() {
 		return nil
