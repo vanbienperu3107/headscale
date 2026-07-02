@@ -1,7 +1,9 @@
 package dns
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,12 +15,21 @@ import (
 	"tailscale.com/types/dnstype"
 )
 
+const (
+	splitCacheTTL             = 30 * time.Second
+	defaultDashboardTimeoutMs = 500
+)
+
+var errDashboardStatus = errors.New("dashboard returned non-200 status")
+
 // splitCache holds the dashboard-managed split-DNS rules (domain -> resolvers).
 // This is GLOBAL, not per-node (unlike derp/patch.go's per-nodeKey cache) — the
-// split-DNS routing table is the same for every node. Entry expires after 30s
-// so CMS changes propagate within a minute, matching Feature B's DERPMap TTL.
+// split-DNS routing table is the same for every node. Entry expires after
+// splitCacheTTL so CMS changes propagate within a minute, matching Feature B's
+// DERPMap TTL.
 var splitCache struct {
 	sync.RWMutex
+
 	routes    map[string][]*dnstype.Resolver
 	expiresAt time.Time
 	loaded    bool
@@ -30,7 +41,7 @@ var splitCache struct {
 //
 // Behavior (same fail-open shape as derp.PatchDERPMap):
 //   - dashboardURL empty or base nil -> base unchanged, no HTTP call
-//   - Cache hit (< 30s) -> merge cached rules into base.Routes
+//   - Cache hit (< splitCacheTTL) -> merge cached rules into base.Routes
 //   - Dashboard call times out / errors -> log warning, reuse last known-good
 //     rules (or none, if never fetched successfully) — never blocks or clears
 //     existing rules on a transient error
@@ -52,6 +63,7 @@ func PatchSplitDNS(dashboardURL, dashboardSecret string, timeoutMs int, base *ta
 	if base.Routes == nil {
 		base.Routes = make(map[string][]*dnstype.Resolver, len(routes))
 	}
+
 	for domain, resolvers := range routes {
 		base.Routes[domain] = resolvers
 	}
@@ -61,25 +73,28 @@ func PatchSplitDNS(dashboardURL, dashboardSecret string, timeoutMs int, base *ta
 
 func getCachedOrFetch(dashboardURL, dashboardSecret string, timeoutMs int) map[string][]*dnstype.Resolver {
 	splitCache.RLock()
-	if splitCache.loaded && time.Now().Before(splitCache.expiresAt) {
-		routes := splitCache.routes
-		splitCache.RUnlock()
-		return routes
-	}
+	cacheValid := splitCache.loaded && time.Now().Before(splitCache.expiresAt)
+	cached := splitCache.routes
 	splitCache.RUnlock()
+
+	if cacheValid {
+		return cached
+	}
 
 	routes, err := fetchSplitDNS(dashboardURL, dashboardSecret, timeoutMs)
 	if err != nil {
 		log.Warn().Err(err).Msg("dns/patch: dashboard call failed, keeping previous split-DNS rules")
+
 		splitCache.RLock()
 		prev := splitCache.routes
 		splitCache.RUnlock()
+
 		return prev
 	}
 
 	splitCache.Lock()
 	splitCache.routes = routes
-	splitCache.expiresAt = time.Now().Add(30 * time.Second)
+	splitCache.expiresAt = time.Now().Add(splitCacheTTL)
 	splitCache.loaded = true
 	splitCache.Unlock()
 
@@ -88,27 +103,31 @@ func getCachedOrFetch(dashboardURL, dashboardSecret string, timeoutMs int) map[s
 
 func fetchSplitDNS(dashboardURL, dashboardSecret string, timeoutMs int) (map[string][]*dnstype.Resolver, error) {
 	if timeoutMs <= 0 {
-		timeoutMs = 500
+		timeoutMs = defaultDashboardTimeoutMs
 	}
 
-	url := fmt.Sprintf("%s/api/internal/dns-split", dashboardURL)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+
+	reqURL := dashboardURL + "/api/internal/dns-split"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
+
 	if dashboardSecret != "" {
 		req.Header.Set("X-Headscale-Secret", dashboardSecret)
 	}
 
-	client := &http.Client{Timeout: time.Duration(timeoutMs) * time.Millisecond}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("dashboard returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("%w: %d", errDashboardStatus, resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -118,7 +137,9 @@ func fetchSplitDNS(dashboardURL, dashboardSecret string, timeoutMs int) (map[str
 
 	// Response shape: {"domain.": ["1.2.3.4", "https://doh.example/dns-query"], ...}
 	var raw map[string][]string
-	if err := json.Unmarshal(body, &raw); err != nil {
+
+	err = json.Unmarshal(body, &raw)
+	if err != nil {
 		return nil, fmt.Errorf("parse split-dns response: %w", err)
 	}
 
@@ -128,6 +149,7 @@ func fetchSplitDNS(dashboardURL, dashboardSecret string, timeoutMs int) (map[str
 		for _, ns := range nameservers {
 			resolvers = append(resolvers, &dnstype.Resolver{Addr: ns})
 		}
+
 		routes[domain] = resolvers
 	}
 

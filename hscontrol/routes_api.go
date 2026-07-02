@@ -20,6 +20,7 @@ func comparePrefix(a, b netip.Prefix) int {
 	if c := a.Addr().Compare(b.Addr()); c != 0 {
 		return c
 	}
+
 	return a.Bits() - b.Bits()
 }
 
@@ -125,6 +126,7 @@ func (h *Headscale) RouteEnableHandler(w http.ResponseWriter, r *http.Request) {
 	if !slices.Contains(approved, prefix) {
 		approved = append(approved, prefix)
 	}
+
 	slices.SortFunc(approved, comparePrefix)
 	approved = slices.Compact(approved)
 
