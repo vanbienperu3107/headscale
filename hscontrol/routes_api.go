@@ -13,6 +13,16 @@ import (
 	"github.com/juanfont/headscale/hscontrol/types"
 )
 
+// comparePrefix orders netip.Prefix values by address then bits.
+// netip.Prefix has no exported Compare method (unlike netip.Addr, which
+// does) — this is the standard workaround.
+func comparePrefix(a, b netip.Prefix) int {
+	if c := a.Addr().Compare(b.Addr()); c != 0 {
+		return c
+	}
+	return a.Bits() - b.Bits()
+}
+
 // routeNodeJSON is the embedded node info returned in a route response.
 type routeNodeJSON struct {
 	ID        string `json:"id"`
@@ -115,7 +125,7 @@ func (h *Headscale) RouteEnableHandler(w http.ResponseWriter, r *http.Request) {
 	if !slices.Contains(approved, prefix) {
 		approved = append(approved, prefix)
 	}
-	slices.SortFunc(approved, netip.Prefix.Compare)
+	slices.SortFunc(approved, comparePrefix)
 	approved = slices.Compact(approved)
 
 	_, nodeChange, err := h.state.SetApprovedRoutes(nodeID, approved)
