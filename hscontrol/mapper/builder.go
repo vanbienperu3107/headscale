@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/derp"
+	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
@@ -159,6 +160,9 @@ func (b *MapResponseBuilder) WithSSHPolicy() *MapResponseBuilder {
 }
 
 // WithDNSConfig adds DNS configuration for the requesting node.
+// If dashboard integration is configured, dashboard-managed split-DNS rules
+// (CMS-editable, e.g. corp intranet domains) are merged in on top of any
+// static dns.nameservers.split entries from config.yaml.
 func (b *MapResponseBuilder) WithDNSConfig() *MapResponseBuilder {
 	node, ok := b.mapper.state.GetNodeByID(b.nodeID)
 	if !ok {
@@ -166,7 +170,20 @@ func (b *MapResponseBuilder) WithDNSConfig() *MapResponseBuilder {
 		return b
 	}
 
-	b.resp.DNSConfig = generateDNSConfig(b.mapper.cfg, node)
+	dnsConfig := generateDNSConfig(b.mapper.cfg, node)
+
+	// Reuses Feature B's dashboard connection settings (same dashboard, same
+	// secret) — no separate DNS dashboard config block needed.
+	if b.mapper.cfg.DERP.DashboardEnabled {
+		dnsConfig = dns.PatchSplitDNS(
+			b.mapper.cfg.DERP.DashboardURL,
+			b.mapper.cfg.DERP.DashboardSecret,
+			b.mapper.cfg.DERP.DashboardTimeoutMs,
+			dnsConfig,
+		)
+	}
+
+	b.resp.DNSConfig = dnsConfig
 
 	return b
 }
