@@ -6,6 +6,8 @@ import (
 	"slices"
 	"time"
 
+	"github.com/juanfont/headscale/hscontrol/derp"
+	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/hscontrol/types"
@@ -118,8 +120,19 @@ func (b *MapResponseBuilder) WithDebugType(t debugType) *MapResponseBuilder {
 }
 
 // WithDERPMap adds the DERP map to the response.
+// If dashboard integration is configured, a per-node override is fetched and applied.
 func (b *MapResponseBuilder) WithDERPMap() *MapResponseBuilder {
-	b.resp.DERPMap = b.mapper.state.DERPMap().AsStruct()
+	base := b.mapper.state.DERPMap().AsStruct()
+
+	// Feature B: per-node DERPMap override from dashboard
+	if b.mapper.cfg.DERP.DashboardEnabled {
+		if nv, ok := b.mapper.state.GetNodeByID(b.nodeID); ok {
+			nodeKey := nv.NodeKey().String()
+			base = derp.PatchDERPMap(b.mapper.cfg.DERP, nodeKey, base)
+		}
+	}
+
+	b.resp.DERPMap = base
 	return b
 }
 
@@ -172,13 +185,29 @@ func (b *MapResponseBuilder) WithSSHPolicy() *MapResponseBuilder {
 }
 
 // WithDNSConfig adds DNS configuration for the requesting node.
+// If dashboard integration is configured, dashboard-managed split-DNS rules
+// (CMS-editable, e.g. corp intranet domains) are merged in on top of any
+// static dns.nameservers.split entries from config.yaml.
 func (b *MapResponseBuilder) WithDNSConfig() *MapResponseBuilder {
 	node, ok := b.node()
 	if !ok {
 		return b
 	}
 
-	b.resp.DNSConfig = generateDNSConfig(b.mapper.cfg, node, b.mapper.state.NodeCapMap(node.ID()))
+	dnsConfig := generateDNSConfig(b.mapper.cfg, node, b.mapper.state.NodeCapMap(node.ID()))
+
+	// Reuses Feature B's dashboard connection settings (same dashboard, same
+	// secret) — no separate DNS dashboard config block needed.
+	if b.mapper.cfg.DERP.DashboardEnabled {
+		dnsConfig = dns.PatchSplitDNS(
+			b.mapper.cfg.DERP.DashboardURL,
+			b.mapper.cfg.DERP.DashboardSecret,
+			b.mapper.cfg.DERP.DashboardTimeoutMs,
+			dnsConfig,
+		)
+	}
+
+	b.resp.DNSConfig = dnsConfig
 
 	return b
 }
