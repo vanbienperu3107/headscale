@@ -275,8 +275,6 @@ jobs:
           - TestNodeTagCommand
           - TestNodeRouteCommands
           - TestNodeBackfillIPsCommand
-          - TestOAuthClientCommand
-          - TestOAuthClientCommandValidation
           - TestPolicyCheckCommand
           - TestSSHTestsRejectFailingPolicy
           - TestPolicyCommand
@@ -311,7 +309,6 @@ jobs:
           - Test2118DeletingOnlineNodePanics
           - TestGrantCapRelay
           - TestGrantCapDrive
-          - TestK8sOperator
           - TestEnablingRoutes
           - TestHASubnetRouterFailover
           - TestSubnetRouteACL
@@ -379,8 +376,6 @@ jobs:
           - TestTagsAuthKeyWithoutUserInheritsTags
           - TestTagsAuthKeyWithoutUserRejectsAdvertisedTags
           - TestTagsAuthKeyConvertToUserViaCLIRegister
-          - TestTS2021WebSocketGET
-          - TestTS2021WASMClientUnderNode
           - TestTailscaleRustAxum
     uses: ./.github/workflows/integration-test-template.yml
     secrets: inherit

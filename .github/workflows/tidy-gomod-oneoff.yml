@@ -1,0 +1,31 @@
+name: tidy-gomod-oneoff
+on:
+  workflow_dispatch:
+
+jobs:
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chore/sync-upstream-headscale
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: go mod tidy + build check
+        run: |
+          go mod tidy
+          go build ./... 2>&1 | tee /tmp/build.log || true
+          echo "---BUILD LOG TAIL---"
+          tail -100 /tmp/build.log || true
+      - name: commit and push if changed
+        run: |
+          git config user.name "tidy-bot"
+          git config user.email "actions@github.com"
+          if git diff --quiet -- go.mod go.sum; then
+            echo "no changes to go.mod/go.sum"
+          else
+            git add go.mod go.sum
+            git commit -m "chore: go mod tidy (auto, one-off CI fix)"
+            git push origin HEAD:chore/sync-upstream-headscale
+          fi
