@@ -257,6 +257,13 @@ type DERPConfig struct {
 	UpdateFrequency                    time.Duration
 	IPv4                               string
 	IPv6                               string
+
+	// Dashboard integration — per-node DERPMap override (Feature B) + reused
+	// by split-DNS (Feature D), one dashboard/secret for both.
+	DashboardEnabled   bool
+	DashboardURL       string // e.g. https://dashboard.hangocthanh.io.vn
+	DashboardSecret    string // X-Headscale-Secret header value
+	DashboardTimeoutMs int    // HTTP call timeout in milliseconds (default 500)
 }
 
 type LogTailConfig struct {
@@ -793,6 +800,11 @@ func derpConfig() DERPConfig {
 		IPv4:                               ipv4,
 		IPv6:                               ipv6,
 		AutomaticallyAddEmbeddedDerpRegion: automaticallyAddEmbeddedDerpRegion,
+		// Feature B / D
+		DashboardEnabled:   viper.GetBool("derp.dashboard.enabled"),
+		DashboardURL:       viper.GetString("derp.dashboard.url"),
+		DashboardSecret:    viper.GetString("derp.dashboard.secret"),
+		DashboardTimeoutMs: viper.GetInt("derp.dashboard.timeout_ms"),
 	}
 }
 
