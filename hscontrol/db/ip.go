@@ -161,6 +161,45 @@ func (i *IPAllocator) Next() (*netip.Addr, *netip.Addr, error) {
 	return ret4, ret6, nil
 }
 
+// errIPAlreadyReserved is returned by Reserve when ip is already handed out
+// to another node, or falls outside any configured prefix — the caller
+// (state.createAndSaveNewNode) treats this as non-fatal and falls back to
+// Next() so registration is never blocked by a stale/conflicting reservation.
+var errIPAlreadyReserved = errors.New("ip already reserved or out of range")
+
+// Reserve claims a specific IP for a new node — used by the MAC-based
+// static/historical IP feature (CMS GET /api/internal/reserved-ip): a node
+// re-registering under a MAC seen before can be handed back its previous
+// address instead of a fresh random one. Marks ip used in the same usedIPs
+// set Next() consults, so the two allocation paths can never race each other
+// onto the same address.
+func (i *IPAllocator) Reserve(ip netip.Addr) (*netip.Addr, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	inPrefix := (i.prefix4 != nil && i.prefix4.Contains(ip)) || (i.prefix6 != nil && i.prefix6.Contains(ip))
+	if !inPrefix {
+		return nil, errIPAlreadyReserved
+	}
+
+	set, err := i.usedIPs.IPSet()
+	if err != nil {
+		return nil, fmt.Errorf("building used IP set: %w", err)
+	}
+	if set.Contains(ip) {
+		return nil, errIPAlreadyReserved
+	}
+
+	i.usedIPs.Add(ip)
+	if ip.Is4() {
+		i.prev4 = ip
+	} else {
+		i.prev6 = ip
+	}
+
+	return &ip, nil
+}
+
 var ErrCouldNotAllocateIP = errors.New("failed to allocate IP")
 
 // allocateNext allocates the next address from prefix under i.mu, advancing
