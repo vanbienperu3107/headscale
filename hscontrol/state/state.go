@@ -28,6 +28,7 @@ import (
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/policy"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
+	"github.com/juanfont/headscale/hscontrol/reservedip"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -1851,6 +1852,42 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 // createAndSaveNewNode creates a new node, allocates IPs, saves to DB, and adds to [NodeStore].
 // It preserves netinfo from an existing node if one is provided (for faster DERP connectivity).
+// allocateNodeIPs picks IPv4/IPv6 for a newly-registering node. If the client
+// reported a primary MAC via Hostinfo.WoLMACs[0] (tailscale_mod client only —
+// a stock/default build never sets this, so this path is a no-op for it) and
+// the CMS dashboard has a reserved/historical IP for that MAC, the reserved
+// IPv4 is used instead of a fresh one from IPAllocator.Next() — this only
+// overrides IPv4, IPv6 always comes from the normal allocator. Fail-open at
+// every step (no MAC, dashboard unreachable, no reservation, or the reserved
+// address already taken by another node): falls back to Next() silently,
+// registration is never blocked by this.
+func (s *State) allocateNodeIPs(hostinfo *tailcfg.Hostinfo) (*netip.Addr, *netip.Addr, error) {
+	if mac := primaryMACFromHostinfo(hostinfo); mac != "" {
+		if addr, ok := reservedip.FetchReservedIP(s.cfg.DERP.DashboardURL, s.cfg.DERP.DashboardSecret, mac, s.cfg.DERP.DashboardTimeoutMs); ok {
+			if ipv4, err := s.ipAlloc.Reserve(addr); err == nil {
+				_, ipv6, err := s.ipAlloc.Next()
+				if err != nil {
+					return nil, nil, fmt.Errorf("allocating IPv6 after IPv4 reservation: %w", err)
+				}
+
+				return ipv4, ipv6, nil
+			}
+		}
+	}
+
+	return s.ipAlloc.Next()
+}
+
+// primaryMACFromHostinfo returns the client-reported primary MAC, or "" if
+// absent (stock client, or tailscale_mod build with nodeMode == "").
+func primaryMACFromHostinfo(hostinfo *tailcfg.Hostinfo) string {
+	if hostinfo == nil || len(hostinfo.WoLMACs) == 0 {
+		return ""
+	}
+
+	return strings.ToLower(strings.TrimSpace(hostinfo.WoLMACs[0]))
+}
+
 func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, error) {
 	// Preserve NetInfo from existing node if available
 	if params.Hostinfo != nil {
@@ -1968,8 +2005,10 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		return types.NodeView{}, err
 	}
 
-	// Allocate new IPs
-	ipv4, ipv6, err := s.ipAlloc.Next()
+	// Allocate new IPs — a MAC-based static/historical reservation from the
+	// CMS dashboard (see allocateNodeIPs) takes priority over a fresh
+	// Next() allocation, letting a reinstalled device keep its old address.
+	ipv4, ipv6, err := s.allocateNodeIPs(params.Hostinfo)
 	if err != nil {
 		return types.NodeView{}, fmt.Errorf("allocating IPs: %w", err)
 	}
