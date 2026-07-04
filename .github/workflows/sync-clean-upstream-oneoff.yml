@@ -1,0 +1,33 @@
+name: sync-clean-upstream-oneoff
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: fetch real upstream and create clean branch
+        run: |
+          git config user.name "sync-bot"
+          git config user.email "actions@github.com"
+          git remote add upstream https://github.com/juanfont/headscale.git
+          git fetch upstream main
+          git branch -f chore/upstream-clean-main upstream/main
+          git push origin chore/upstream-clean-main -f
+      - name: sanity build check on clean upstream
+        run: |
+          git checkout chore/upstream-clean-main
+          go build ./... 2>&1 | tee /tmp/build.log || true
+          echo "---BUILD LOG (last 100 lines)---"
+          tail -100 /tmp/build.log || true
+          echo "---go.mod go directive---"
+          head -5 go.mod
