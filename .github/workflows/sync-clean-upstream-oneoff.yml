@@ -21,7 +21,13 @@ jobs:
           git config user.email "actions@github.com"
           git remote add upstream https://github.com/juanfont/headscale.git
           git fetch upstream main
-          git branch -f chore/upstream-clean-main upstream/main
+          git checkout -B chore/upstream-clean-main upstream/main
+          # Default GITHUB_TOKEN cannot push changes to .github/workflows/*
+          # (GitHub API restriction, not fixable via permissions: block) --
+          # keep our own already-approved workflow files unchanged instead.
+          git checkout main -- .github/workflows
+          git add .github/workflows
+          git commit -m "chore: keep our own workflow files (token can't push workflow changes)" --allow-empty
           git push origin chore/upstream-clean-main -f
       - name: sanity build check on clean upstream
         run: |
