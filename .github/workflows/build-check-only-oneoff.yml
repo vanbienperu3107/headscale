@@ -1,0 +1,24 @@
+name: build-check-only-oneoff
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+      - name: build + vet
+        run: |
+          go build ./... 2>&1 | tee /tmp/build.log
+          echo "---BUILD EXIT: $?---"
+          echo "---VET---"
+          go vet ./... 2>&1 | tee /tmp/vet.log || true
