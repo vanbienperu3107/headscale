@@ -4,27 +4,29 @@ import (
 	"archive/tar"
 	"bytes"
 	"cmp"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	clientv1 "github.com/juanfont/headscale/gen/client/v1"
 	"github.com/juanfont/headscale/hscontrol"
 	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
-	"github.com/juanfont/headscale/hscontrol/routes"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -32,9 +34,9 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	"gopkg.in/yaml.v3"
-	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -46,9 +48,18 @@ const (
 	tlsKeyPath                    = "/etc/headscale/tls.key"
 	headscaleDefaultPort          = 8080
 	IntegrationTestDockerFileName = "Dockerfile.integration"
+	defaultDirPerm                = 0o755
+	binHeadscale                  = "headscale"
+	flagOutput                    = "--output"
+	acceptJSON                    = "Accept: application/json"
 )
 
-var errHeadscaleStatusCodeNotOk = errors.New("headscale status code not ok")
+var (
+	errHeadscaleStatusCodeNotOk    = errors.New("headscale status code not ok")
+	errInvalidHeadscaleImageFormat = errors.New("invalid HEADSCALE_INTEGRATION_HEADSCALE_IMAGE format, expected repository:tag")
+	errHeadscaleImageRequiredInCI  = errors.New("HEADSCALE_INTEGRATION_HEADSCALE_IMAGE must be set in CI")
+	errInvalidPostgresImageFormat  = errors.New("invalid HEADSCALE_INTEGRATION_POSTGRES_IMAGE format, expected repository:tag")
+)
 
 type fileInContainer struct {
 	path     string
@@ -69,13 +80,15 @@ type HeadscaleInContainer struct {
 	// optional config
 	port             int
 	extraPorts       []string
-	debugPort        int
+	hostMetricsPort  string // Dynamically assigned host port for metrics/pprof access
 	caCerts          [][]byte
 	hostPortBindings map[string][]string
 	aclPolicy        *policyv2.Policy
 	env              map[string]string
+	tlsCACert        []byte
 	tlsCert          []byte
 	tlsKey           []byte
+	noTLS            bool
 	filesInContainer []fileInContainer
 	postgres         bool
 	policyMode       types.PolicyMode
@@ -85,8 +98,8 @@ type HeadscaleInContainer struct {
 // Headscale instance.
 type Option = func(c *HeadscaleInContainer)
 
-// WithACLPolicy adds a hscontrol.ACLPolicy policy to the
-// HeadscaleInContainer instance.
+// WithACLPolicy adds a [policyv2.Policy] to the
+// [HeadscaleInContainer] instance.
 func WithACLPolicy(acl *policyv2.Policy) Option {
 	return func(hsic *HeadscaleInContainer) {
 		if acl == nil {
@@ -107,24 +120,24 @@ func WithCACert(cert []byte) Option {
 	}
 }
 
-// WithTLS creates certificates and enables HTTPS.
-func WithTLS() Option {
+// WithoutTLS disables the default TLS configuration.
+// Most tests should not need this. Use only for tests that
+// explicitly need to test non-TLS behavior.
+func WithoutTLS() Option {
 	return func(hsic *HeadscaleInContainer) {
-		cert, key, err := integrationutil.CreateCertificate(hsic.hostname)
-		if err != nil {
-			log.Fatalf("failed to create certificates for headscale test: %s", err)
-		}
-
-		hsic.tlsCert = cert
-		hsic.tlsKey = key
+		hsic.noTLS = true
 	}
 }
 
 // WithCustomTLS uses the given certificates for the Headscale instance.
-func WithCustomTLS(cert, key []byte) Option {
+// The caCert is installed into the container's trust store and returned
+// by [HeadscaleInContainer.GetCert] so that clients can trust this server.
+func WithCustomTLS(caCert, cert, key []byte) Option {
 	return func(hsic *HeadscaleInContainer) {
+		hsic.tlsCACert = caCert
 		hsic.tlsCert = cert
 		hsic.tlsKey = key
+		hsic.caCerts = append(hsic.caCerts, caCert)
 	}
 }
 
@@ -132,9 +145,7 @@ func WithCustomTLS(cert, key []byte) Option {
 // can be used to override Headscale configuration.
 func WithConfigEnv(configEnv map[string]string) Option {
 	return func(hsic *HeadscaleInContainer) {
-		for key, value := range configEnv {
-			hsic.env[key] = value
-		}
+		maps.Copy(hsic.env, configEnv)
 	}
 }
 
@@ -162,7 +173,7 @@ func WithHostPortBindings(bindings map[string][]string) Option {
 // in the Docker container name.
 func WithTestName(testName string) Option {
 	return func(hsic *HeadscaleInContainer) {
-		hash, _ := util.GenerateRandomStringDNSSafe(hsicHashLength)
+		hash := rands.HexString(hsicHashLength)
 
 		hostname := fmt.Sprintf("hs-%s-%s", testName, hash)
 		hsic.hostname = hostname
@@ -195,7 +206,7 @@ func WithPostgres() Option {
 	}
 }
 
-// WithPolicy sets the policy mode for headscale.
+// WithPolicyMode sets the policy mode for headscale.
 func WithPolicyMode(mode types.PolicyMode) Option {
 	return func(hsic *HeadscaleInContainer) {
 		hsic.policyMode = mode
@@ -210,23 +221,20 @@ func WithIPAllocationStrategy(strategy types.IPAllocationStrategy) Option {
 	}
 }
 
-// WithEmbeddedDERPServerOnly configures Headscale to start
-// and only use the embedded DERP server.
-// It requires WithTLS and WithHostnameAsServerURL to be
-// set.
-func WithEmbeddedDERPServerOnly() Option {
+// WithPublicDERP disables the embedded DERP server and restores
+// the default public DERP relay configuration. Use this for tests
+// that explicitly need to test public DERP behavior.
+func WithPublicDERP() Option {
 	return func(hsic *HeadscaleInContainer) {
-		hsic.env["HEADSCALE_DERP_URLS"] = ""
-		hsic.env["HEADSCALE_DERP_SERVER_ENABLED"] = "true"
-		hsic.env["HEADSCALE_DERP_SERVER_REGION_ID"] = "999"
-		hsic.env["HEADSCALE_DERP_SERVER_REGION_CODE"] = "headscale"
-		hsic.env["HEADSCALE_DERP_SERVER_REGION_NAME"] = "Headscale Embedded DERP"
-		hsic.env["HEADSCALE_DERP_SERVER_STUN_LISTEN_ADDR"] = "0.0.0.0:3478"
-		hsic.env["HEADSCALE_DERP_SERVER_PRIVATE_KEY_PATH"] = "/tmp/derp.key"
-
-		// Envknob for enabling DERP debug logs
-		hsic.env["DERP_DEBUG_LOGS"] = "true"
-		hsic.env["DERP_PROBER_DEBUG_LOGS"] = "true"
+		hsic.env["HEADSCALE_DERP_URLS"] = "https://controlplane.tailscale.com/derpmap/default"
+		hsic.env["HEADSCALE_DERP_SERVER_ENABLED"] = "false"
+		delete(hsic.env, "HEADSCALE_DERP_SERVER_REGION_ID")
+		delete(hsic.env, "HEADSCALE_DERP_SERVER_REGION_CODE")
+		delete(hsic.env, "HEADSCALE_DERP_SERVER_REGION_NAME")
+		delete(hsic.env, "HEADSCALE_DERP_SERVER_STUN_LISTEN_ADDR")
+		delete(hsic.env, "HEADSCALE_DERP_SERVER_PRIVATE_KEY_PATH")
+		delete(hsic.env, "DERP_DEBUG_LOGS")
+		delete(hsic.env, "DERP_PROBER_DEBUG_LOGS")
 	}
 }
 
@@ -236,7 +244,7 @@ func WithDERPConfig(derpMap tailcfg.DERPMap) Option {
 	return func(hsic *HeadscaleInContainer) {
 		contents, err := yaml.Marshal(derpMap)
 		if err != nil {
-			log.Fatalf("failed to marshal DERP map: %s", err)
+			log.Fatalf("marshalling DERP map: %s", err)
 
 			return
 		}
@@ -268,67 +276,80 @@ func WithTuning(batchTimeout time.Duration, mapSessionChanSize int) Option {
 	}
 }
 
+func WithHAProbing(interval, timeout time.Duration) Option {
+	return func(hsic *HeadscaleInContainer) {
+		hsic.env["HEADSCALE_NODE_ROUTES_HA_PROBE_INTERVAL"] = interval.String()
+		hsic.env["HEADSCALE_NODE_ROUTES_HA_PROBE_TIMEOUT"] = timeout.String()
+	}
+}
+
 func WithTimezone(timezone string) Option {
 	return func(hsic *HeadscaleInContainer) {
 		hsic.env["TZ"] = timezone
 	}
 }
 
-// WithDERPAsIP enables using IP address instead of hostname for DERP server.
-// This is useful for integration tests where DNS resolution may be unreliable.
-func WithDERPAsIP() Option {
-	return func(hsic *HeadscaleInContainer) {
-		hsic.env["HEADSCALE_DEBUG_DERP_USE_IP"] = "1"
-	}
-}
-
-// WithDebugPort sets the debug port for delve debugging.
-func WithDebugPort(port int) Option {
-	return func(hsic *HeadscaleInContainer) {
-		hsic.debugPort = port
-	}
-}
-
 // buildEntrypoint builds the container entrypoint command based on configuration.
+// It constructs proper wait conditions instead of fixed sleeps:
+// 1. Wait for network to be ready
+// 2. Wait for config.yaml (always written after container start)
+// 3. Wait for CA certs if configured
+// 4. Update CA certificates
+// 5. Run headscale serve
+// 6. Sleep at end to keep container alive for log collection on shutdown.
 func (hsic *HeadscaleInContainer) buildEntrypoint() []string {
-	debugCmd := fmt.Sprintf(
-		"/go/bin/dlv --listen=0.0.0.0:%d --headless=true --api-version=2 --accept-multiclient --allow-non-terminal-interactive=true exec /go/bin/headscale --continue -- serve",
-		hsic.debugPort,
-	)
+	var commands []string
 
-	entrypoint := fmt.Sprintf(
-		"/bin/sleep 3 ; update-ca-certificates ; %s ; /bin/sleep 30",
-		debugCmd,
-	)
+	// Wait for network to be ready
+	commands = append(commands, "while ! ip route show default >/dev/null 2>&1; do sleep 0.1; done")
 
-	return []string{"/bin/bash", "-c", entrypoint}
+	// Wait for config.yaml to be written (always written after container start)
+	commands = append(commands, "while [ ! -f /etc/headscale/config.yaml ]; do sleep 0.1; done")
+
+	// If CA certs are configured, wait for them to be written
+	if len(hsic.caCerts) > 0 {
+		commands = append(commands,
+			fmt.Sprintf("while [ ! -f %s/user-0.crt ]; do sleep 0.1; done", caCertRoot))
+	}
+
+	// Update CA certificates
+	commands = append(commands, "update-ca-certificates")
+
+	// Run headscale serve
+	commands = append(commands, "/usr/local/bin/headscale serve")
+
+	// Keep container alive after headscale exits for log collection
+	commands = append(commands, "/bin/sleep 30")
+
+	return []string{"/bin/bash", "-c", strings.Join(commands, " ; ")}
 }
 
-// New returns a new HeadscaleInContainer instance.
+// New returns a new [HeadscaleInContainer] instance.
+//
+//nolint:gocyclo // complex container setup with many options
 func New(
 	pool *dockertest.Pool,
 	networks []*dockertest.Network,
 	opts ...Option,
 ) (*HeadscaleInContainer, error) {
-	hash, err := util.GenerateRandomStringDNSSafe(hsicHashLength)
-	if err != nil {
-		return nil, err
-	}
+	hash := rands.HexString(hsicHashLength)
 
-	hostname := "hs-" + hash
+	// Include run ID in hostname for easier identification of which test run owns this container
+	runID := dockertestutil.GetIntegrationRunID()
 
-	// Get debug port from environment or use default
-	debugPort := 40000
-	if envDebugPort := envknob.String("HEADSCALE_DEBUG_PORT"); envDebugPort != "" {
-		if port, err := strconv.Atoi(envDebugPort); err == nil {
-			debugPort = port
-		}
+	var hostname string
+
+	if runID != "" {
+		// Use last 6 chars of run ID (the random hash part) for brevity
+		runIDShort := runID[len(runID)-6:]
+		hostname = fmt.Sprintf("hs-%s-%s", runIDShort, hash)
+	} else {
+		hostname = "hs-" + hash
 	}
 
 	hsic := &HeadscaleInContainer{
-		hostname:  hostname,
-		port:      headscaleDefaultPort,
-		debugPort: debugPort,
+		hostname: hostname,
+		port:     headscaleDefaultPort,
 
 		pool:     pool,
 		networks: networks,
@@ -342,10 +363,29 @@ func New(
 		opt(hsic)
 	}
 
+	// TLS is enabled by default for all integration tests.
+	// Generate a self-signed certificate if TLS was not explicitly
+	// disabled via [WithoutTLS] and no custom cert was provided
+	// via [WithCustomTLS].
+	if !hsic.noTLS && len(hsic.tlsCert) == 0 {
+		caCert, cert, key, err := integrationutil.CreateCertificate(hsic.hostname)
+		if err != nil {
+			return nil, fmt.Errorf("creating default TLS certificates: %w", err)
+		}
+
+		hsic.tlsCACert = caCert
+		hsic.tlsCert = cert
+		hsic.tlsKey = key
+
+		// Install the CA cert into the headscale container's trust
+		// store so that tools like curl trust the server's own
+		// certificate.
+		hsic.caCerts = append(hsic.caCerts, caCert)
+	}
+
 	log.Println("NAME: ", hsic.hostname)
 
 	portProto := fmt.Sprintf("%d/tcp", hsic.port)
-	debugPortProto := fmt.Sprintf("%d/tcp", hsic.debugPort)
 
 	headscaleBuildOptions := &dockertest.BuildOptions{
 		Dockerfile: IntegrationTestDockerFileName,
@@ -355,15 +395,29 @@ func New(
 	if hsic.postgres {
 		hsic.env["HEADSCALE_DATABASE_TYPE"] = "postgres"
 		hsic.env["HEADSCALE_DATABASE_POSTGRES_HOST"] = "postgres-" + hash
-		hsic.env["HEADSCALE_DATABASE_POSTGRES_USER"] = "headscale"
-		hsic.env["HEADSCALE_DATABASE_POSTGRES_PASS"] = "headscale"
-		hsic.env["HEADSCALE_DATABASE_POSTGRES_NAME"] = "headscale"
+		hsic.env["HEADSCALE_DATABASE_POSTGRES_USER"] = binHeadscale
+		hsic.env["HEADSCALE_DATABASE_POSTGRES_PASS"] = binHeadscale
+		hsic.env["HEADSCALE_DATABASE_POSTGRES_NAME"] = binHeadscale
 		delete(hsic.env, "HEADSCALE_DATABASE_SQLITE_PATH")
+
+		// Determine postgres image - use prebuilt if available, otherwise pull from registry
+		pgRepo := "postgres"
+		pgTag := "latest"
+
+		if prebuiltImage := os.Getenv("HEADSCALE_INTEGRATION_POSTGRES_IMAGE"); prebuiltImage != "" {
+			repo, tag, found := strings.Cut(prebuiltImage, ":")
+			if !found {
+				return nil, errInvalidPostgresImageFormat
+			}
+
+			pgRepo = repo
+			pgTag = tag
+		}
 
 		pgRunOptions := &dockertest.RunOptions{
 			Name:       "postgres-" + hash,
-			Repository: "postgres",
-			Tag:        "latest",
+			Repository: pgRepo,
+			Tag:        pgTag,
 			Networks:   networks,
 			Env: []string{
 				"POSTGRES_USER=headscale",
@@ -410,7 +464,7 @@ func New(
 
 	runOptions := &dockertest.RunOptions{
 		Name:         hsic.hostname,
-		ExposedPorts: append([]string{portProto, debugPortProto, "9090/tcp"}, hsic.extraPorts...),
+		ExposedPorts: append([]string{portProto, "9090/tcp"}, hsic.extraPorts...),
 		Networks:     networks,
 		// Cmd:          []string{"headscale", "serve"},
 		// TODO(kradalby): Get rid of this hack, we currently need to give us some
@@ -419,15 +473,13 @@ func New(
 		Env:        env,
 	}
 
-	// Always bind debug port and metrics port to predictable host ports
+	// Bind metrics port to dynamic host port (kernel assigns free port)
 	if runOptions.PortBindings == nil {
 		runOptions.PortBindings = map[docker.Port][]docker.PortBinding{}
 	}
-	runOptions.PortBindings[docker.Port(debugPortProto)] = []docker.PortBinding{
-		{HostPort: strconv.Itoa(hsic.debugPort)},
-	}
+
 	runOptions.PortBindings["9090/tcp"] = []docker.PortBinding{
-		{HostPort: "49090"},
+		{HostPort: "0"}, // Let kernel assign a free port
 	}
 
 	if len(hsic.hostPortBindings) > 0 {
@@ -436,7 +488,8 @@ func New(
 			for _, hostPort := range hostPorts {
 				runOptions.PortBindings[docker.Port(port)] = append(
 					runOptions.PortBindings[docker.Port(port)],
-					docker.PortBinding{HostPort: hostPort})
+					docker.PortBinding{HostPort: hostPort},
+				)
 			}
 		}
 	}
@@ -444,51 +497,107 @@ func New(
 	// dockertest isn't very good at handling containers that has already
 	// been created, this is an attempt to make sure this container isn't
 	// present.
-	err = pool.RemoveContainerByName(hsic.hostname)
+	err := pool.RemoveContainerByName(hsic.hostname)
 	if err != nil {
 		return nil, err
 	}
 
 	// Add integration test labels if running under hi tool
-	dockertestutil.DockerAddIntegrationLabels(runOptions, "headscale")
+	dockertestutil.DockerAddIntegrationLabels(runOptions, binHeadscale)
 
-	container, err := pool.BuildAndRunWithBuildOptions(
-		headscaleBuildOptions,
-		runOptions,
-		dockertestutil.DockerRestartPolicy,
-		dockertestutil.DockerAllowLocalIPv6,
-		dockertestutil.DockerAllowNetworkAdministration,
-	)
-	if err != nil {
-		// Try to get more detailed build output
-		log.Printf("Docker build failed, attempting to get detailed output...")
-		buildOutput := dockertestutil.RunDockerBuildForDiagnostics(dockerContextPath, IntegrationTestDockerFileName)
-		if buildOutput != "" {
-			return nil, fmt.Errorf("could not start headscale container: %w\n\nDetailed build output:\n%s", err, buildOutput)
+	var container *dockertest.Resource
+
+	// Check if a pre-built image is available via environment variable
+	prebuiltImage := os.Getenv("HEADSCALE_INTEGRATION_HEADSCALE_IMAGE")
+
+	if prebuiltImage != "" {
+		log.Printf("Using pre-built headscale image: %s", prebuiltImage) //nolint:gosec // G706: integration-only log of trusted env value
+		// Parse image into repository and tag
+		repo, tag, ok := strings.Cut(prebuiltImage, ":")
+		if !ok {
+			return nil, errInvalidHeadscaleImageFormat
 		}
-		return nil, fmt.Errorf("could not start headscale container: %w", err)
+
+		runOptions.Repository = repo
+		runOptions.Tag = tag
+
+		container, err = pool.RunWithOptions(
+			runOptions,
+			dockertestutil.DockerRestartPolicy,
+			dockertestutil.DockerAllowLocalIPv6,
+			dockertestutil.DockerAllowNetworkAdministration,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("running pre-built headscale container %q: %w", prebuiltImage, err)
+		}
+	} else if util.IsCI() {
+		return nil, errHeadscaleImageRequiredInCI
+	} else {
+		container, err = pool.BuildAndRunWithBuildOptions(
+			headscaleBuildOptions,
+			runOptions,
+			dockertestutil.DockerRestartPolicy,
+			dockertestutil.DockerAllowLocalIPv6,
+			dockertestutil.DockerAllowNetworkAdministration,
+		)
+		if err != nil {
+			// Try to get more detailed build output
+			log.Printf("Docker build/run failed, attempting to get detailed output...")
+
+			buildOutput, buildErr := dockertestutil.RunDockerBuildForDiagnostics(dockerContextPath, IntegrationTestDockerFileName)
+
+			// Show the last 100 lines of build output to avoid overwhelming the logs
+			lines := strings.Split(buildOutput, "\n")
+
+			const maxLines = 100
+
+			startLine := 0
+			if len(lines) > maxLines {
+				startLine = len(lines) - maxLines
+			}
+
+			relevantOutput := strings.Join(lines[startLine:], "\n")
+
+			if buildErr != nil {
+				// The diagnostic build also failed - this is the real error
+				return nil, fmt.Errorf("starting headscale container: %w\n\nDocker build failed. Last %d lines of output:\n%s", err, maxLines, relevantOutput)
+			}
+
+			if buildOutput != "" {
+				// Build succeeded on retry but container creation still failed
+				return nil, fmt.Errorf("starting headscale container: %w\n\nDocker build succeeded on retry, but container creation failed. Last %d lines of build output:\n%s", err, maxLines, relevantOutput)
+			}
+
+			// No output at all - diagnostic build command may have failed
+			return nil, fmt.Errorf("starting headscale container: %w\n\nUnable to get diagnostic build output (command may have failed silently)", err)
+		}
 	}
+
 	log.Printf("Created %s container\n", hsic.hostname)
 
 	hsic.container = container
 
+	// Get the dynamically assigned host port for metrics/pprof
+	hsic.hostMetricsPort = container.GetHostPort("9090/tcp")
+
 	log.Printf(
-		"Debug ports for %s: delve=%s, metrics/pprof=49090\n",
+		"Headscale %s metrics available at http://localhost:%s/metrics (debug at http://localhost:%s/debug/)\n",
 		hsic.hostname,
-		hsic.GetHostDebugPort(),
+		hsic.hostMetricsPort,
+		hsic.hostMetricsPort,
 	)
 
 	// Write the CA certificates to the container
 	for i, cert := range hsic.caCerts {
 		err = hsic.WriteFile(fmt.Sprintf("%s/user-%d.crt", caCertRoot, i), cert)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write TLS certificate to container: %w", err)
+			return nil, fmt.Errorf("writing TLS certificate to container: %w", err)
 		}
 	}
 
 	err = hsic.WriteFile("/etc/headscale/config.yaml", []byte(MinimumConfigYAML()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to write headscale config to container: %w", err)
+		return nil, fmt.Errorf("writing headscale config to container: %w", err)
 	}
 
 	if hsic.aclPolicy != nil {
@@ -501,18 +610,19 @@ func New(
 	if hsic.hasTLS() {
 		err = hsic.WriteFile(tlsCertPath, hsic.tlsCert)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write TLS certificate to container: %w", err)
+			return nil, fmt.Errorf("writing TLS certificate to container: %w", err)
 		}
 
 		err = hsic.WriteFile(tlsKeyPath, hsic.tlsKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write TLS key to container: %w", err)
+			return nil, fmt.Errorf("writing TLS key to container: %w", err)
 		}
 	}
 
 	for _, f := range hsic.filesInContainer {
-		if err := hsic.WriteFile(f.path, f.contents); err != nil {
-			return nil, fmt.Errorf("failed to write %q: %w", f.path, err)
+		err := hsic.WriteFile(f.path, f.contents)
+		if err != nil {
+			return nil, fmt.Errorf("writing %q: %w", f.path, err)
 		}
 	}
 
@@ -541,15 +651,15 @@ func (t *HeadscaleInContainer) Shutdown() (string, string, error) {
 	stdoutPath, stderrPath, err := t.SaveLog("/tmp/control")
 	if err != nil {
 		log.Printf(
-			"Failed to save log from control: %s",
-			fmt.Errorf("failed to save log from control: %w", err),
+			"saving log from control: %s",
+			fmt.Errorf("saving log from control: %w", err),
 		)
 	}
 
 	err = t.SaveMetrics(fmt.Sprintf("/tmp/control/%s_metrics.txt", t.hostname))
 	if err != nil {
 		log.Printf(
-			"Failed to metrics from control: %s",
+			"saving metrics from control: %s",
 			err,
 		)
 	}
@@ -560,24 +670,24 @@ func (t *HeadscaleInContainer) Shutdown() (string, string, error) {
 	err = t.SendInterrupt()
 	if err != nil {
 		log.Printf(
-			"Failed to send graceful interrupt to control: %s",
-			fmt.Errorf("failed to send graceful interrupt to control: %w", err),
+			"sending graceful interrupt to control: %s",
+			fmt.Errorf("sending graceful interrupt to control: %w", err),
 		)
 	}
 
 	err = t.SaveProfile("/tmp/control")
 	if err != nil {
 		log.Printf(
-			"Failed to save profile from control: %s",
-			fmt.Errorf("failed to save profile from control: %w", err),
+			"saving profile from control: %s",
+			fmt.Errorf("saving profile from control: %w", err),
 		)
 	}
 
 	err = t.SaveMapResponses("/tmp/control")
 	if err != nil {
 		log.Printf(
-			"Failed to save mapresponses from control: %s",
-			fmt.Errorf("failed to save mapresponses from control: %w", err),
+			"saving mapresponses from control: %s",
+			fmt.Errorf("saving mapresponses from control: %w", err),
 		)
 	}
 
@@ -586,24 +696,36 @@ func (t *HeadscaleInContainer) Shutdown() (string, string, error) {
 		err = t.SaveDatabase("/tmp/control")
 		if err != nil {
 			log.Printf(
-				"Failed to save database from control: %s",
-				fmt.Errorf("failed to save database from control: %w", err),
+				"saving database from control: %s",
+				fmt.Errorf("saving database from control: %w", err),
 			)
 		}
 	}
 
 	// Cleanup postgres container if enabled.
 	if t.postgres {
-		t.pool.Purge(t.pgContainer)
+		_ = t.pool.Purge(t.pgContainer)
 	}
 
 	return stdoutPath, stderrPath, t.pool.Purge(t.container)
 }
 
 // WriteLogs writes the current stdout/stderr log of the container to
-// the given io.Writers.
+// the given [io.Writer]s.
 func (t *HeadscaleInContainer) WriteLogs(stdout, stderr io.Writer) error {
 	return dockertestutil.WriteLog(t.pool, t.container, stdout, stderr)
+}
+
+// ReadLog returns the current stdout and stderr logs from the headscale container.
+func (t *HeadscaleInContainer) ReadLog() (string, string, error) {
+	var stdout, stderr bytes.Buffer
+
+	err := dockertestutil.WriteLog(t.pool, t.container, &stdout, &stderr)
+	if err != nil {
+		return "", "", fmt.Errorf("reading container logs: %w", err)
+	}
+
+	return stdout.String(), stderr.String(), nil
 }
 
 // SaveLog saves the current stdout log of the container to a path
@@ -613,16 +735,23 @@ func (t *HeadscaleInContainer) SaveLog(path string) (string, string, error) {
 }
 
 func (t *HeadscaleInContainer) SaveMetrics(savePath string) error {
-	resp, err := http.Get(fmt.Sprintf("http://%s:9090/metrics", t.hostname))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+net.JoinHostPort(t.hostname, "9090")+"/metrics", nil)
+	if err != nil {
+		return fmt.Errorf("creating metrics request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("getting metrics: %w", err)
 	}
 	defer resp.Body.Close()
+
 	out, err := os.Create(savePath)
 	if err != nil {
 		return fmt.Errorf("creating file for metrics: %w", err)
 	}
 	defer out.Close()
+
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		return fmt.Errorf("copy response to file: %w", err)
@@ -633,22 +762,23 @@ func (t *HeadscaleInContainer) SaveMetrics(savePath string) error {
 
 // extractTarToDirectory extracts a tar archive to a directory.
 func extractTarToDirectory(tarData []byte, targetDir string) error {
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
+	err := os.MkdirAll(targetDir, defaultDirPerm)
+	if err != nil {
+		return fmt.Errorf("creating directory %s: %w", targetDir, err)
 	}
-
-	tarReader := tar.NewReader(bytes.NewReader(tarData))
 
 	// Find the top-level directory to strip
 	var topLevelDir string
+
 	firstPass := tar.NewReader(bytes.NewReader(tarData))
 	for {
 		header, err := firstPass.Next()
 		if err == io.EOF {
 			break
 		}
+
 		if err != nil {
-			return fmt.Errorf("failed to read tar header: %w", err)
+			return fmt.Errorf("reading tar header: %w", err)
 		}
 
 		if header.Typeflag == tar.TypeDir && topLevelDir == "" {
@@ -657,14 +787,15 @@ func extractTarToDirectory(tarData []byte, targetDir string) error {
 		}
 	}
 
-	tarReader = tar.NewReader(bytes.NewReader(tarData))
+	tarReader := tar.NewReader(bytes.NewReader(tarData))
 	for {
 		header, err := tarReader.Next()
 		if err == io.EOF {
 			break
 		}
+
 		if err != nil {
-			return fmt.Errorf("failed to read tar header: %w", err)
+			return fmt.Errorf("reading tar header: %w", err)
 		}
 
 		// Clean the path to prevent directory traversal
@@ -691,30 +822,34 @@ func extractTarToDirectory(tarData []byte, targetDir string) error {
 		switch header.Typeflag {
 		case tar.TypeDir:
 			// Create directory
-			if err := os.MkdirAll(targetPath, os.FileMode(header.Mode)); err != nil {
-				return fmt.Errorf("failed to create directory %s: %w", targetPath, err)
+			//nolint:gosec // G115: header.Mode is trusted from tar archive
+			err := os.MkdirAll(targetPath, os.FileMode(header.Mode))
+			if err != nil {
+				return fmt.Errorf("creating directory %s: %w", targetPath, err)
 			}
 		case tar.TypeReg:
 			// Ensure parent directories exist
-			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-				return fmt.Errorf("failed to create parent directories for %s: %w", targetPath, err)
+			err := os.MkdirAll(filepath.Dir(targetPath), defaultDirPerm)
+			if err != nil {
+				return fmt.Errorf("creating parent directories for %s: %w", targetPath, err)
 			}
 
 			// Create file
 			outFile, err := os.Create(targetPath)
 			if err != nil {
-				return fmt.Errorf("failed to create file %s: %w", targetPath, err)
+				return fmt.Errorf("creating file %s: %w", targetPath, err)
 			}
 
-			if _, err := io.Copy(outFile, tarReader); err != nil {
+			if _, err := io.Copy(outFile, tarReader); err != nil { //nolint:gosec,noinlineerr // trusted tar from test container
 				outFile.Close()
-				return fmt.Errorf("failed to copy file contents: %w", err)
+				return fmt.Errorf("copying file contents: %w", err)
 			}
+
 			outFile.Close()
 
 			// Set file permissions
-			if err := os.Chmod(targetPath, os.FileMode(header.Mode)); err != nil {
-				return fmt.Errorf("failed to set file permissions: %w", err)
+			if err := os.Chmod(targetPath, os.FileMode(header.Mode)); err != nil { //nolint:gosec,noinlineerr // safe mode from tar header
+				return fmt.Errorf("setting file permissions: %w", err)
 			}
 		}
 	}
@@ -760,25 +895,27 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 
 	// Check if the database file exists and has a schema
 	dbPath := "/tmp/integration_test_db.sqlite3"
+
 	fileInfo, err := t.Execute([]string{"ls", "-la", dbPath})
 	if err != nil {
 		return fmt.Errorf("database file does not exist at %s: %w", dbPath, err)
 	}
+
 	log.Printf("Database file info: %s", fileInfo)
 
 	// Check if the database has any tables (schema)
 	schemaCheck, err := t.Execute([]string{"sqlite3", dbPath, ".schema"})
 	if err != nil {
-		return fmt.Errorf("failed to check database schema (sqlite3 command failed): %w", err)
+		return fmt.Errorf("checking database schema (sqlite3 command failed): %w", err)
 	}
 
 	if strings.TrimSpace(schemaCheck) == "" {
-		return errors.New("database file exists but has no schema (empty database)")
+		return errors.New("database file exists but has no schema (empty database)") //nolint:err113
 	}
 
 	tarFile, err := t.FetchPath("/tmp/integration_test_db.sqlite3")
 	if err != nil {
-		return fmt.Errorf("failed to fetch database file: %w", err)
+		return fmt.Errorf("fetching database file: %w", err)
 	}
 
 	// For database, extract the first regular file (should be the SQLite file)
@@ -788,8 +925,9 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 		if err == io.EOF {
 			break
 		}
+
 		if err != nil {
-			return fmt.Errorf("failed to read tar header: %w", err)
+			return fmt.Errorf("reading tar header: %w", err)
 		}
 
 		log.Printf(
@@ -802,15 +940,17 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 		// Extract the first regular file we find
 		if header.Typeflag == tar.TypeReg {
 			dbPath := path.Join(savePath, t.hostname+".db")
+
 			outFile, err := os.Create(dbPath)
 			if err != nil {
-				return fmt.Errorf("failed to create database file: %w", err)
+				return fmt.Errorf("creating database file: %w", err)
 			}
 
-			written, err := io.Copy(outFile, tarReader)
+			written, err := io.Copy(outFile, tarReader) //nolint:gosec // trusted tar from test container
 			outFile.Close()
+
 			if err != nil {
-				return fmt.Errorf("failed to copy database file: %w", err)
+				return fmt.Errorf("copying database file: %w", err)
 			}
 
 			log.Printf(
@@ -822,7 +962,7 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 
 			// Check if we actually wrote something
 			if written == 0 {
-				return fmt.Errorf(
+				return fmt.Errorf( //nolint:err113
 					"database file is empty (size: %d, header size: %d)",
 					written,
 					header.Size,
@@ -833,7 +973,7 @@ func (t *HeadscaleInContainer) SaveDatabase(savePath string) error {
 		}
 	}
 
-	return errors.New("no regular file found in database tar archive")
+	return errors.New("no regular file found in database tar archive") //nolint:err113
 }
 
 // Execute runs a command inside the Headscale container and returns the
@@ -865,23 +1005,20 @@ func (t *HeadscaleInContainer) GetPort() string {
 	return strconv.Itoa(t.port)
 }
 
-// GetDebugPort returns the debug port as a string.
-func (t *HeadscaleInContainer) GetDebugPort() string {
-	return strconv.Itoa(t.debugPort)
+// GetHostMetricsPort returns the dynamically assigned host port for metrics/pprof access.
+// This port can be used by operators to access metrics at http://localhost:{port}/metrics
+// and debug endpoints at http://localhost:{port}/debug/ while tests are running.
+func (t *HeadscaleInContainer) GetHostMetricsPort() string {
+	return t.hostMetricsPort
 }
 
-// GetHostDebugPort returns the host port mapped to the debug port.
-func (t *HeadscaleInContainer) GetHostDebugPort() string {
-	return strconv.Itoa(t.debugPort)
-}
-
-// GetHealthEndpoint returns a health endpoint for the HeadscaleInContainer
+// GetHealthEndpoint returns a health endpoint for the [HeadscaleInContainer]
 // instance.
 func (t *HeadscaleInContainer) GetHealthEndpoint() string {
 	return t.GetEndpoint() + "/health"
 }
 
-// GetEndpoint returns the Headscale endpoint for the HeadscaleInContainer.
+// GetEndpoint returns the Headscale endpoint for the [HeadscaleInContainer].
 func (t *HeadscaleInContainer) GetEndpoint() string {
 	return t.getEndpoint(false)
 }
@@ -910,17 +1047,18 @@ func (t *HeadscaleInContainer) getEndpoint(useIP bool) string {
 	return "http://" + hostEndpoint
 }
 
-// GetCert returns the public certificate of the HeadscaleInContainer.
+// GetCert returns the CA certificate that clients should trust to
+// verify this server's TLS certificate.
 func (t *HeadscaleInContainer) GetCert() []byte {
-	return t.tlsCert
+	return t.tlsCACert
 }
 
-// GetHostname returns the hostname of the HeadscaleInContainer.
+// GetHostname returns the hostname of the [HeadscaleInContainer].
 func (t *HeadscaleInContainer) GetHostname() string {
 	return t.hostname
 }
 
-// GetIPInNetwork returns the IP address of the HeadscaleInContainer in the given network.
+// GetIPInNetwork returns the IP address of the [HeadscaleInContainer] in the given network.
 func (t *HeadscaleInContainer) GetIPInNetwork(network *dockertest.Network) string {
 	return t.container.GetIPInNetwork(network)
 }
@@ -957,14 +1095,14 @@ func (t *HeadscaleInContainer) WaitForRunning() error {
 // CreateUser adds a new user to the Headscale instance.
 func (t *HeadscaleInContainer) CreateUser(
 	user string,
-) (*v1.User, error) {
+) (*clientv1.User, error) {
 	command := []string{
-		"headscale",
+		binHeadscale,
 		"users",
 		"create",
 		user,
 		fmt.Sprintf("--email=%s@test.no", user),
-		"--output",
+		flagOutput,
 		"json",
 	}
 
@@ -977,40 +1115,61 @@ func (t *HeadscaleInContainer) CreateUser(
 		return nil, err
 	}
 
-	var u v1.User
+	var u clientv1.User
+
 	err = json.Unmarshal([]byte(result), &u)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal user: %w", err)
+		return nil, fmt.Errorf("unmarshalling user: %w", err)
 	}
 
 	return &u, nil
 }
 
-// CreateAuthKey creates a new "authorisation key" for a User that can be used
-// to authorise a TailscaleClient with the Headscale instance.
-func (t *HeadscaleInContainer) CreateAuthKey(
-	user uint64,
-	reusable bool,
-	ephemeral bool,
-) (*v1.PreAuthKey, error) {
+// AuthKeyOptions defines options for creating an auth key.
+type AuthKeyOptions struct {
+	// User is the user ID that owns the auth key. If nil and Tags are specified,
+	// the auth key is owned by the tags only (tags-as-identity model).
+	User *uint64
+	// Reusable indicates if the key can be used multiple times
+	Reusable bool
+	// Ephemeral indicates if nodes registered with this key should be ephemeral
+	Ephemeral bool
+	// Tags are the tags to assign to the auth key
+	Tags []string
+}
+
+// CreateAuthKeyWithOptions creates a new "authorisation key" with the specified options.
+// This supports both user-owned and tags-only auth keys.
+func (t *HeadscaleInContainer) CreateAuthKeyWithOptions(opts AuthKeyOptions) (*clientv1.PreAuthKey, error) {
 	command := []string{
-		"headscale",
-		"--user",
-		strconv.FormatUint(user, 10),
+		binHeadscale,
+	}
+
+	// Only add --user flag if User is specified
+	if opts.User != nil {
+		command = append(command, "--user", strconv.FormatUint(*opts.User, 10))
+	}
+
+	command = append(
+		command,
 		"preauthkeys",
 		"create",
 		"--expiration",
 		"24h",
-		"--output",
+		flagOutput,
 		"json",
-	}
+	)
 
-	if reusable {
+	if opts.Reusable {
 		command = append(command, "--reusable")
 	}
 
-	if ephemeral {
+	if opts.Ephemeral {
 		command = append(command, "--ephemeral")
+	}
+
+	if len(opts.Tags) > 0 {
+		command = append(command, "--tags", strings.Join(opts.Tags, ","))
 	}
 
 	result, _, err := dockertestutil.ExecuteCommand(
@@ -1019,16 +1178,73 @@ func (t *HeadscaleInContainer) CreateAuthKey(
 		[]string{},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute create auth key command: %w", err)
+		return nil, fmt.Errorf("executing create auth key command: %w", err)
 	}
 
-	var preAuthKey v1.PreAuthKey
+	var preAuthKey clientv1.PreAuthKey
+
 	err = json.Unmarshal([]byte(result), &preAuthKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal auth key: %w", err)
+		return nil, fmt.Errorf("unmarshalling auth key: %w", err)
 	}
 
 	return &preAuthKey, nil
+}
+
+// CreateAuthKey creates a new "authorisation key" for a User that can be used
+// to authorise a TailscaleClient with the [HeadscaleInContainer] instance.
+func (t *HeadscaleInContainer) CreateAuthKey(
+	user uint64,
+	reusable bool,
+	ephemeral bool,
+) (*clientv1.PreAuthKey, error) {
+	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
+		User:      &user,
+		Reusable:  reusable,
+		Ephemeral: ephemeral,
+	})
+}
+
+// CreateAuthKeyWithTags creates a new "authorisation key" for a User with the specified tags.
+// This is used to create tagged PreAuthKeys for testing the tags-as-identity model.
+func (t *HeadscaleInContainer) CreateAuthKeyWithTags(
+	user uint64,
+	reusable bool,
+	ephemeral bool,
+	tags []string,
+) (*clientv1.PreAuthKey, error) {
+	return t.CreateAuthKeyWithOptions(AuthKeyOptions{
+		User:      &user,
+		Reusable:  reusable,
+		Ephemeral: ephemeral,
+		Tags:      tags,
+	})
+}
+
+// DeleteAuthKey deletes an "authorisation key" by ID.
+func (t *HeadscaleInContainer) DeleteAuthKey(
+	id uint64,
+) error {
+	command := []string{
+		binHeadscale,
+		"preauthkeys",
+		"delete",
+		"--id",
+		strconv.FormatUint(id, 10),
+		flagOutput,
+		"json",
+	}
+
+	_, _, err := dockertestutil.ExecuteCommand(
+		t.container,
+		command,
+		[]string{},
+	)
+	if err != nil {
+		return fmt.Errorf("executing delete auth key command: %w", err)
+	}
+
+	return nil
 }
 
 // ListNodes lists the currently registered Nodes in headscale.
@@ -1036,8 +1252,9 @@ func (t *HeadscaleInContainer) CreateAuthKey(
 // specific users.
 func (t *HeadscaleInContainer) ListNodes(
 	users ...string,
-) ([]*v1.Node, error) {
-	var ret []*v1.Node
+) ([]*clientv1.Node, error) {
+	var ret []*clientv1.Node
+
 	execUnmarshal := func(command []string) error {
 		result, _, err := dockertestutil.ExecuteCommand(
 			t.container,
@@ -1045,13 +1262,14 @@ func (t *HeadscaleInContainer) ListNodes(
 			[]string{},
 		)
 		if err != nil {
-			return fmt.Errorf("failed to execute list node command: %w", err)
+			return fmt.Errorf("executing list node command: %w", err)
 		}
 
-		var nodes []*v1.Node
+		var nodes []*clientv1.Node
+
 		err = json.Unmarshal([]byte(result), &nodes)
 		if err != nil {
-			return fmt.Errorf("failed to unmarshal nodes: %w", err)
+			return fmt.Errorf("unmarshalling nodes: %w", err)
 		}
 
 		ret = append(ret, nodes...)
@@ -1060,13 +1278,13 @@ func (t *HeadscaleInContainer) ListNodes(
 	}
 
 	if len(users) == 0 {
-		err := execUnmarshal([]string{"headscale", "nodes", "list", "--output", "json"})
+		err := execUnmarshal([]string{binHeadscale, "nodes", "list", flagOutput, "json"})
 		if err != nil {
 			return nil, err
 		}
 	} else {
 		for _, user := range users {
-			command := []string{"headscale", "--user", user, "nodes", "list", "--output", "json"}
+			command := []string{binHeadscale, "--user", user, "nodes", "list", flagOutput, "json"}
 
 			err := execUnmarshal(command)
 			if err != nil {
@@ -1075,8 +1293,11 @@ func (t *HeadscaleInContainer) ListNodes(
 		}
 	}
 
-	sort.Slice(ret, func(i, j int) bool {
-		return cmp.Compare(ret[i].GetId(), ret[j].GetId()) == -1
+	slices.SortFunc(ret, func(a, b *clientv1.Node) int {
+		ai, _ := strconv.ParseUint(a.Id, 10, 64)
+		bi, _ := strconv.ParseUint(b.Id, 10, 64)
+
+		return cmp.Compare(ai, bi)
 	})
 
 	return ret, nil
@@ -1084,12 +1305,12 @@ func (t *HeadscaleInContainer) ListNodes(
 
 func (t *HeadscaleInContainer) DeleteNode(nodeID uint64) error {
 	command := []string{
-		"headscale",
+		binHeadscale,
 		"nodes",
 		"delete",
 		"--identifier",
-		fmt.Sprintf("%d", nodeID),
-		"--output",
+		strconv.FormatUint(nodeID, 10),
+		flagOutput,
 		"json",
 		"--force",
 	}
@@ -1100,47 +1321,45 @@ func (t *HeadscaleInContainer) DeleteNode(nodeID uint64) error {
 		[]string{},
 	)
 	if err != nil {
-		return fmt.Errorf("failed to execute delete node command: %w", err)
+		return fmt.Errorf("executing delete node command: %w", err)
 	}
 
 	return nil
 }
 
-func (t *HeadscaleInContainer) NodesByUser() (map[string][]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByUser() (map[string][]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	var userMap map[string][]*v1.Node
+	userMap := make(map[string][]*clientv1.Node)
+
 	for _, node := range nodes {
-		if _, ok := userMap[node.GetUser().GetName()]; !ok {
-			mak.Set(&userMap, node.GetUser().GetName(), []*v1.Node{node})
-		} else {
-			userMap[node.GetUser().GetName()] = append(userMap[node.GetUser().GetName()], node)
-		}
+		name := node.User.Name
+		userMap[name] = append(userMap[name], node)
 	}
 
 	return userMap, nil
 }
 
-func (t *HeadscaleInContainer) NodesByName() (map[string]*v1.Node, error) {
+func (t *HeadscaleInContainer) NodesByName() (map[string]*clientv1.Node, error) {
 	nodes, err := t.ListNodes()
 	if err != nil {
 		return nil, err
 	}
 
-	var nameMap map[string]*v1.Node
+	var nameMap map[string]*clientv1.Node
 	for _, node := range nodes {
-		mak.Set(&nameMap, node.GetName(), node)
+		mak.Set(&nameMap, node.Name, node)
 	}
 
 	return nameMap, nil
 }
 
 // ListUsers returns a list of users from Headscale.
-func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
-	command := []string{"headscale", "users", "list", "--output", "json"}
+func (t *HeadscaleInContainer) ListUsers() ([]*clientv1.User, error) {
+	command := []string{binHeadscale, "users", "list", flagOutput, "json"}
 
 	result, _, err := dockertestutil.ExecuteCommand(
 		t.container,
@@ -1148,13 +1367,14 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 		[]string{},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute list node command: %w", err)
+		return nil, fmt.Errorf("executing list node command: %w", err)
 	}
 
-	var users []*v1.User
+	var users []*clientv1.User
+
 	err = json.Unmarshal([]byte(result), &users)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal nodes: %w", err)
+		return nil, fmt.Errorf("unmarshalling nodes: %w", err)
 	}
 
 	return users, nil
@@ -1162,18 +1382,43 @@ func (t *HeadscaleInContainer) ListUsers() ([]*v1.User, error) {
 
 // MapUsers returns a map of users from Headscale. It is keyed by the
 // user name.
-func (t *HeadscaleInContainer) MapUsers() (map[string]*v1.User, error) {
+func (t *HeadscaleInContainer) MapUsers() (map[string]*clientv1.User, error) {
 	users, err := t.ListUsers()
 	if err != nil {
 		return nil, err
 	}
 
-	var userMap map[string]*v1.User
+	var userMap map[string]*clientv1.User
 	for _, user := range users {
-		mak.Set(&userMap, user.GetName(), user)
+		mak.Set(&userMap, user.Name, user)
 	}
 
 	return userMap, nil
+}
+
+// DeleteUser deletes a user from the Headscale instance.
+func (t *HeadscaleInContainer) DeleteUser(userID uint64) error {
+	command := []string{
+		binHeadscale,
+		"users",
+		"delete",
+		"--identifier",
+		strconv.FormatUint(userID, 10),
+		"--force",
+		flagOutput,
+		"json",
+	}
+
+	_, _, err := dockertestutil.ExecuteCommand(
+		t.container,
+		command,
+		[]string{},
+	)
+	if err != nil {
+		return fmt.Errorf("executing delete user command: %w", err)
+	}
+
+	return nil
 }
 
 func (h *HeadscaleInContainer) SetPolicy(pol *policyv2.Policy) error {
@@ -1203,7 +1448,7 @@ func (h *HeadscaleInContainer) SetPolicy(pol *policyv2.Policy) error {
 func (h *HeadscaleInContainer) reloadDatabasePolicy() error {
 	_, err := h.Execute(
 		[]string{
-			"headscale",
+			binHeadscale,
 			"policy",
 			"set",
 			"-f",
@@ -1220,7 +1465,7 @@ func (h *HeadscaleInContainer) reloadDatabasePolicy() error {
 func (h *HeadscaleInContainer) writePolicy(pol *policyv2.Policy) error {
 	pBytes, err := json.Marshal(pol)
 	if err != nil {
-		return fmt.Errorf("marshalling pol: %w", err)
+		return fmt.Errorf("marshalling policy: %w", err)
 	}
 
 	err = h.WriteFile(aclPolicyPath, pBytes)
@@ -1235,7 +1480,7 @@ func (h *HeadscaleInContainer) PID() (int, error) {
 	// Use pidof to find the headscale process, which is more reliable than grep
 	// as it only looks for the actual binary name, not processes that contain
 	// "headscale" in their command line (like the dlv debugger).
-	output, err := h.Execute([]string{"pidof", "headscale"})
+	output, err := h.Execute([]string{"pidof", binHeadscale})
 	if err != nil {
 		// pidof returns exit code 1 when no process is found
 		return 0, os.ErrNotExist
@@ -1257,6 +1502,7 @@ func (h *HeadscaleInContainer) PID() (int, error) {
 		if pidInt == 1 {
 			continue
 		}
+
 		pids = append(pids, pidInt)
 	}
 
@@ -1288,11 +1534,25 @@ func (h *HeadscaleInContainer) Reload() error {
 	return nil
 }
 
+// Restart restarts the headscale container. The on-disk database and keys
+// persist across the restart, but all in-memory state is dropped — including
+// the bounded cache of pending authentication sessions. This reproduces a
+// control-plane restart, one of the real-world cases where a pending SSH-check
+// auth session is lost.
+func (h *HeadscaleInContainer) Restart() error {
+	err := h.pool.Client.RestartContainer(h.container.Container.ID, 30)
+	if err != nil {
+		return fmt.Errorf("restarting headscale container %s: %w", h.hostname, err)
+	}
+
+	return h.WaitForRunning()
+}
+
 // ApproveRoutes approves routes for a node.
-func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*v1.Node, error) {
+func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (*clientv1.Node, error) {
 	command := []string{
-		"headscale", "nodes", "approve-routes",
-		"--output", "json",
+		binHeadscale, "nodes", "approve-routes",
+		flagOutput, "json",
 		"--identifier", strconv.FormatUint(id, 10),
 		"--routes=" + strings.Join(util.PrefixesToString(routes), ","),
 	}
@@ -1304,20 +1564,51 @@ func (t *HeadscaleInContainer) ApproveRoutes(id uint64, routes []netip.Prefix) (
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"failed to execute approve routes command (node %d, routes %v): %w",
+			"executing approve routes command (node %d, routes %v): %w",
 			id,
 			routes,
 			err,
 		)
 	}
 
-	var node *v1.Node
+	var node *clientv1.Node
+
 	err = json.Unmarshal([]byte(result), &node)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal node response: %q, error: %w", result, err)
+		return nil, fmt.Errorf("unmarshalling node response: %q, error: %w", result, err)
 	}
 
 	return node, nil
+}
+
+// SetNodeTags sets tags on a node via the headscale CLI.
+// This simulates what the Tailscale admin console UI does - it calls the headscale
+// SetTags API which is exposed via the CLI command: headscale nodes tag -i <id> -t <tags>.
+func (t *HeadscaleInContainer) SetNodeTags(nodeID uint64, tags []string) error {
+	command := []string{
+		binHeadscale, "nodes", "tag",
+		"--identifier", strconv.FormatUint(nodeID, 10),
+		flagOutput, "json",
+	}
+
+	// Add tags - the CLI expects -t flag for each tag or comma-separated
+	if len(tags) > 0 {
+		command = append(command, "--tags", strings.Join(tags, ","))
+	} else {
+		// Empty tags to clear all tags
+		command = append(command, "--tags", "")
+	}
+
+	_, _, err := dockertestutil.ExecuteCommand(
+		t.container,
+		command,
+		[]string{},
+	)
+	if err != nil {
+		return fmt.Errorf("executing set tags command (node %d, tags %v): %w", nodeID, tags, err)
+	}
+
+	return nil
 }
 
 // WriteFile save file inside the Headscale container.
@@ -1332,7 +1623,7 @@ func (t *HeadscaleInContainer) FetchPath(path string) ([]byte, error) {
 }
 
 func (t *HeadscaleInContainer) SendInterrupt() error {
-	pid, err := t.Execute([]string{"pidof", "headscale"})
+	pid, err := t.Execute([]string{"pidof", binHeadscale})
 	if err != nil {
 		return err
 	}
@@ -1346,102 +1637,48 @@ func (t *HeadscaleInContainer) SendInterrupt() error {
 }
 
 func (t *HeadscaleInContainer) GetAllMapReponses() (map[types.NodeID][]tailcfg.MapResponse, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/mapresponses",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching mapresponses from debug endpoint: %w", err)
-	}
-
-	var res map[types.NodeID][]tailcfg.MapResponse
-	if err := json.Unmarshal([]byte(result), &res); err != nil {
-		return nil, fmt.Errorf("decoding routes response: %w", err)
-	}
-
-	return res, nil
+	return debugJSON[map[types.NodeID][]tailcfg.MapResponse](t, "mapresponses")
 }
 
 // PrimaryRoutes fetches the primary routes from the debug endpoint.
-func (t *HeadscaleInContainer) PrimaryRoutes() (*routes.DebugRoutes, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/routes",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching routes from debug endpoint: %w", err)
-	}
-
-	var debugRoutes routes.DebugRoutes
-	if err := json.Unmarshal([]byte(result), &debugRoutes); err != nil {
-		return nil, fmt.Errorf("decoding routes response: %w", err)
-	}
-
-	return &debugRoutes, nil
+func (t *HeadscaleInContainer) PrimaryRoutes() (*types.DebugRoutes, error) {
+	return debugJSON[*types.DebugRoutes](t, "routes")
 }
 
 // DebugBatcher fetches the batcher debug information from the debug endpoint.
 func (t *HeadscaleInContainer) DebugBatcher() (*hscontrol.DebugBatcherInfo, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/batcher",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching batcher debug info: %w", err)
-	}
-
-	var debugInfo hscontrol.DebugBatcherInfo
-	if err := json.Unmarshal([]byte(result), &debugInfo); err != nil {
-		return nil, fmt.Errorf("decoding batcher debug response: %w", err)
-	}
-
-	return &debugInfo, nil
+	return debugJSON[*hscontrol.DebugBatcherInfo](t, "batcher")
 }
 
-// DebugNodeStore fetches the NodeStore data from the debug endpoint.
+// DebugNodeStore fetches the [state.NodeStore] data from the debug endpoint.
 func (t *HeadscaleInContainer) DebugNodeStore() (map[types.NodeID]types.Node, error) {
-	// Execute curl inside the container to access the debug endpoint locally
-	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/nodestore",
-	}
-
-	result, err := t.Execute(command)
-	if err != nil {
-		return nil, fmt.Errorf("fetching nodestore debug info: %w", err)
-	}
-
-	var nodeStore map[types.NodeID]types.Node
-	if err := json.Unmarshal([]byte(result), &nodeStore); err != nil {
-		return nil, fmt.Errorf("decoding nodestore debug response: %w", err)
-	}
-
-	return nodeStore, nil
+	return debugJSON[map[types.NodeID]types.Node](t, "nodestore")
 }
 
 // DebugFilter fetches the current filter rules from the debug endpoint.
 func (t *HeadscaleInContainer) DebugFilter() ([]tailcfg.FilterRule, error) {
+	return debugJSON[[]tailcfg.FilterRule](t, "filter")
+}
+
+// debugJSON fetches and decodes a JSON-returning debug endpoint by name.
+func debugJSON[T any](t *HeadscaleInContainer, endpoint string) (T, error) {
+	var res T
+
 	// Execute curl inside the container to access the debug endpoint locally
 	command := []string{
-		"curl", "-s", "-H", "Accept: application/json", "http://localhost:9090/debug/filter",
+		"curl", "-s", "-H", acceptJSON, "http://localhost:9090/debug/" + endpoint,
 	}
 
 	result, err := t.Execute(command)
 	if err != nil {
-		return nil, fmt.Errorf("fetching filter from debug endpoint: %w", err)
+		return res, fmt.Errorf("fetching %s from debug endpoint: %w", endpoint, err)
 	}
 
-	var filterRules []tailcfg.FilterRule
-	if err := json.Unmarshal([]byte(result), &filterRules); err != nil {
-		return nil, fmt.Errorf("decoding filter response: %w", err)
+	if err := json.Unmarshal([]byte(result), &res); err != nil { //nolint:noinlineerr
+		return res, fmt.Errorf("decoding %s response: %w", endpoint, err)
 	}
 
-	return filterRules, nil
+	return res, nil
 }
 
 // DebugPolicy fetches the current policy from the debug endpoint.

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/ory/dockertest/v3"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -22,9 +22,9 @@ func GetIntegrationRunID() string {
 	return os.Getenv("HEADSCALE_INTEGRATION_RUN_ID")
 }
 
-// DockerAddIntegrationLabels adds integration test labels to Docker RunOptions.
+// DockerAddIntegrationLabels adds integration test labels to Docker [dockertest.RunOptions].
 // This allows the hi tool to identify containers belonging to specific test runs.
-// This function should be called before passing RunOptions to dockertest functions.
+// This function should be called before passing [dockertest.RunOptions] to dockertest functions.
 func DockerAddIntegrationLabels(opts *dockertest.RunOptions, testType string) {
 	runID := GetIntegrationRunID()
 	if runID == "" {
@@ -34,6 +34,7 @@ func DockerAddIntegrationLabels(opts *dockertest.RunOptions, testType string) {
 	if opts.Labels == nil {
 		opts.Labels = make(map[string]string)
 	}
+
 	opts.Labels["hi.run-id"] = runID
 	opts.Labels["hi.test-type"] = testType
 }
@@ -45,7 +46,7 @@ func GenerateRunID() string {
 	timestamp := now.Format(TimestampFormatRunID)
 
 	// Add a short random hash to ensure uniqueness
-	randomHash := util.MustGenerateRandomStringDNSSafe(6)
+	randomHash := rands.HexString(6)
 
 	return fmt.Sprintf("%s-%s", timestamp, randomHash)
 }

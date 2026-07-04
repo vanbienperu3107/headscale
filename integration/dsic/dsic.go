@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/juanfont/headscale/integration/dockertestutil"
 	"github.com/juanfont/headscale/integration/integrationutil"
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"tailscale.com/util/rands"
 )
 
 const (
@@ -40,6 +40,7 @@ type DERPServerInContainer struct {
 	stunPort            int
 	derpPort            int
 	caCerts             [][]byte
+	tlsCACert           []byte
 	tlsCert             []byte
 	tlsKey              []byte
 	withExtraHosts      []string
@@ -75,7 +76,7 @@ func WithOrCreateNetwork(network *dockertest.Network) Option {
 			dsic.hostname+"-network",
 		)
 		if err != nil {
-			log.Fatalf("failed to create network: %s", err)
+			log.Fatalf("creating network: %s", err)
 		}
 
 		dsic.networks = append(dsic.networks, network)
@@ -103,33 +104,80 @@ func WithExtraHosts(hosts []string) Option {
 	}
 }
 
-// New returns a new TailscaleInContainer instance.
+// buildEntrypoint builds the container entrypoint command based on configuration.
+// It constructs proper wait conditions instead of fixed sleeps:
+// 1. Wait for network to be ready
+// 2. Wait for TLS cert to be written (always written after container start)
+// 3. Wait for CA certs if configured
+// 4. Update CA certificates
+// 5. Run derper with provided arguments.
+func (dsic *DERPServerInContainer) buildEntrypoint(derperArgs string) []string {
+	var commands []string
+
+	// Wait for network to be ready
+	commands = append(commands, "while ! ip route show default >/dev/null 2>&1; do sleep 0.1; done")
+
+	// Wait for TLS cert to be written (always written after container start)
+	commands = append(commands,
+		fmt.Sprintf("while [ ! -f %s/%s.crt ]; do sleep 0.1; done", DERPerCertRoot, dsic.hostname))
+
+	// If CA certs are configured, wait for them to be written
+	if len(dsic.caCerts) > 0 {
+		commands = append(commands,
+			fmt.Sprintf("while [ ! -f %s/user-0.crt ]; do sleep 0.1; done", caCertRoot))
+	}
+
+	// Update CA certificates
+	commands = append(commands, "update-ca-certificates")
+
+	// Run derper
+	commands = append(commands, "derper "+derperArgs)
+
+	return []string{"/bin/sh", "-c", strings.Join(commands, " ; ")}
+}
+
+// New returns a new [tsic.TailscaleInContainer] instance.
 func New(
 	pool *dockertest.Pool,
 	version string,
 	networks []*dockertest.Network,
 	opts ...Option,
 ) (*DERPServerInContainer, error) {
-	hash, err := util.GenerateRandomStringDNSSafe(dsicHashLength)
-	if err != nil {
-		return nil, err
+	hash := rands.HexString(dsicHashLength)
+
+	// Include run ID in hostname for easier identification of which test run owns this container
+	runID := dockertestutil.GetIntegrationRunID()
+
+	var hostname string
+
+	if runID != "" {
+		// Use last 6 chars of run ID (the random hash part) for brevity
+		runIDShort := runID[len(runID)-6:]
+		hostname = fmt.Sprintf("derp-%s-%s-%s", runIDShort, strings.ReplaceAll(version, ".", "-"), hash)
+	} else {
+		hostname = fmt.Sprintf("derp-%s-%s", strings.ReplaceAll(version, ".", "-"), hash)
 	}
 
-	hostname := fmt.Sprintf("derp-%s-%s", strings.ReplaceAll(version, ".", "-"), hash)
-	tlsCert, tlsKey, err := integrationutil.CreateCertificate(hostname)
+	tlsCACert, tlsCert, tlsKey, err := integrationutil.CreateCertificate(hostname)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create certificates for headscale test: %w", err)
+		return nil, fmt.Errorf("creating certificates for derp test: %w", err)
 	}
+
 	dsic := &DERPServerInContainer{
-		version:  version,
-		hostname: hostname,
-		pool:     pool,
-		networks: networks,
-		tlsCert:  tlsCert,
-		tlsKey:   tlsKey,
-		stunPort: 3478, //nolint
-		derpPort: 443,  //nolint
+		version:   version,
+		hostname:  hostname,
+		pool:      pool,
+		networks:  networks,
+		tlsCACert: tlsCACert,
+		tlsCert:   tlsCert,
+		tlsKey:    tlsKey,
+		stunPort:  3478, //nolint
+		derpPort:  443,  //nolint
 	}
+
+	// Install the CA cert so the DERP server trusts its own certificate
+	// and any headscale CA certs passed via [WithCACert].
+	dsic.caCerts = append(dsic.caCerts, tlsCACert)
 
 	for _, opt := range opts {
 		opt(dsic)
@@ -142,6 +190,7 @@ func New(
 	fmt.Fprintf(&cmdArgs, " --a=:%d", dsic.derpPort)
 	fmt.Fprintf(&cmdArgs, " --stun=true")
 	fmt.Fprintf(&cmdArgs, " --stun-port=%d", dsic.stunPort)
+
 	if dsic.withVerifyClientURL != "" {
 		fmt.Fprintf(&cmdArgs, " --verify-client-url=%s", dsic.withVerifyClientURL)
 	}
@@ -150,8 +199,7 @@ func New(
 		Name:       hostname,
 		Networks:   dsic.networks,
 		ExtraHosts: dsic.withExtraHosts,
-		// we currently need to give us some time to inject the certificate further down.
-		Entrypoint: []string{"/bin/sh", "-c", "/bin/sleep 3 ; update-ca-certificates ; derper " + cmdArgs.String()},
+		Entrypoint: dsic.buildEntrypoint(cmdArgs.String()),
 		ExposedPorts: []string{
 			"80/tcp",
 			fmt.Sprintf("%d/tcp", dsic.derpPort),
@@ -172,11 +220,13 @@ func New(
 	}
 
 	var container *dockertest.Resource
+
 	buildOptions := &dockertest.BuildOptions{
 		Dockerfile: "Dockerfile.derper",
 		ContextDir: dockerContextPath,
 		BuildArgs:  []docker.BuildArg{},
 	}
+
 	switch version {
 	case "head":
 		buildOptions.BuildArgs = append(buildOptions.BuildArgs, docker.BuildArg{
@@ -201,12 +251,13 @@ func New(
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
-			"%s could not start tailscale DERPer container (version: %s): %w",
+			"%s starting tailscale DERPer container (version: %s): %w",
 			hostname,
 			version,
 			err,
 		)
 	}
+
 	log.Printf("Created %s container\n", hostname)
 
 	dsic.container = container
@@ -214,19 +265,21 @@ func New(
 	for i, cert := range dsic.caCerts {
 		err = dsic.WriteFile(fmt.Sprintf("%s/user-%d.crt", caCertRoot, i), cert)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write TLS certificate to container: %w", err)
+			return nil, fmt.Errorf("writing TLS certificate to container: %w", err)
 		}
 	}
+
 	if len(dsic.tlsCert) != 0 {
 		err = dsic.WriteFile(fmt.Sprintf("%s/%s.crt", DERPerCertRoot, dsic.hostname), dsic.tlsCert)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write TLS certificate to container: %w", err)
+			return nil, fmt.Errorf("writing TLS certificate to container: %w", err)
 		}
 	}
+
 	if len(dsic.tlsKey) != 0 {
 		err = dsic.WriteFile(fmt.Sprintf("%s/%s.key", DERPerCertRoot, dsic.hostname), dsic.tlsKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to write TLS key to container: %w", err)
+			return nil, fmt.Errorf("writing TLS key to container: %w", err)
 		}
 	}
 
@@ -238,18 +291,19 @@ func (t *DERPServerInContainer) Shutdown() error {
 	err := t.SaveLog("/tmp/control")
 	if err != nil {
 		log.Printf(
-			"Failed to save log from %s: %s",
+			"saving log from %s: %s",
 			t.hostname,
-			fmt.Errorf("failed to save log: %w", err),
+			fmt.Errorf("saving log: %w", err),
 		)
 	}
 
 	return t.pool.Purge(t.container)
 }
 
-// GetCert returns the TLS certificate of the DERPer instance.
+// GetCert returns the CA certificate that clients should trust to
+// verify this DERP server's TLS certificate.
 func (t *DERPServerInContainer) GetCert() []byte {
-	return t.tlsCert
+	return t.tlsCACert
 }
 
 // Hostname returns the hostname of the DERPer instance.
@@ -262,7 +316,7 @@ func (t *DERPServerInContainer) Version() string {
 	return t.version
 }
 
-// ID returns the Docker container ID of the DERPServerInContainer
+// ID returns the Docker container ID of the [DERPServerInContainer]
 // instance.
 func (t *DERPServerInContainer) ID() string {
 	return t.container.Container.ID
@@ -294,7 +348,7 @@ func (t *DERPServerInContainer) WaitForRunning() error {
 	return t.pool.Retry(func() error {
 		resp, err := client.Get(url) //nolint
 		if err != nil {
-			return fmt.Errorf("headscale is not ready: %w", err)
+			return fmt.Errorf("DERPer is not ready: %w", err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
