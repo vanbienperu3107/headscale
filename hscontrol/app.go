@@ -485,6 +485,10 @@ func (h *Headscale) createRouter(apiV1Mux, apiV2Mux http.Handler) *chi.Mux {
 
 	r.Post("/verify", h.VerifyHandler)
 
+	// Dashboard "reload" poke: force an invalidated node to re-fetch its
+	// per-node DERPMap override + re-poll now (guarded by the shared secret).
+	r.Post("/derp/poke", h.DerpPokeHandler)
+
 	if h.cfg.DERP.ServerEnabled {
 		r.HandleFunc("/derp", h.DERPServer.DERPHandler)
 		r.HandleFunc("/derp/probe", derpServer.DERPProbeHandler)
@@ -1001,6 +1005,37 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 // Change is used to send changes to nodes.
 // All change should be enqueued here and empty will be automatically
 // ignored.
+// DerpPokeHandler forces an immediate refresh of a node's per-node DERPMap
+// override and broadcasts a DERP change so the node re-polls promptly, instead
+// of waiting for the 30s patch cache to expire. It reuses the same
+// change.DERPMap() broadcast the periodic DERP ticker uses (scheduledTasks);
+// nodes whose override is unchanged simply hit their cache. Guarded by the
+// shared dashboard secret.
+//
+//	POST /derp/poke?nodeKey=<key>   (nodeKey omitted → invalidate all overrides)
+func (h *Headscale) DerpPokeHandler(w http.ResponseWriter, req *http.Request) {
+	if !h.cfg.DERP.DashboardEnabled {
+		http.Error(w, "dashboard integration disabled", http.StatusNotFound)
+		return
+	}
+	if secret := h.cfg.DERP.DashboardSecret; secret != "" {
+		if req.Header.Get("X-Headscale-Secret") != secret {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	nodeKey := req.URL.Query().Get("nodeKey")
+	if nodeKey != "" {
+		derp.InvalidatePatchCache(nodeKey)
+	} else {
+		derp.InvalidateAllPatchCache()
+	}
+	h.Change(change.DERPMap())
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Headscale) Change(cs ...change.Change) {
 	h.mapBatcher.AddWork(cs...)
 }
