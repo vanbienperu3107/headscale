@@ -115,7 +115,12 @@ func (h *Headscale) RouteEnableHandler(w http.ResponseWriter, r *http.Request) {
 	if !slices.Contains(approved, prefix) {
 		approved = append(approved, prefix)
 	}
-	slices.SortFunc(approved, netip.Prefix.Compare)
+	slices.SortFunc(approved, func(a, b netip.Prefix) int {
+		if c := a.Addr().Compare(b.Addr()); c != 0 {
+			return c
+		}
+		return a.Bits() - b.Bits()
+	})
 	approved = slices.Compact(approved)
 
 	_, nodeChange, err := h.state.SetApprovedRoutes(nodeID, approved)
