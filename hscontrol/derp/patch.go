@@ -68,6 +68,25 @@ func PatchDERPMap(cfg types.DERPConfig, nodeKey string, base *tailcfg.DERPMap) *
 	return override
 }
 
+// InvalidatePatchCache drops the cached per-node override for nodeKey so the
+// next PatchDERPMap call re-fetches it from the dashboard immediately (instead
+// of waiting up to 30s for the entry to expire). Used by the dashboard "reload"
+// poke to make a lock/assignment change take effect promptly.
+func InvalidatePatchCache(nodeKey string) {
+	if nodeKey == "" {
+		return
+	}
+	patchCache.Delete(nodeKey)
+}
+
+// InvalidateAllPatchCache drops every cached per-node override (poke-all).
+func InvalidateAllPatchCache() {
+	patchCache.Range(func(k, _ any) bool {
+		patchCache.Delete(k)
+		return true
+	})
+}
+
 func fetchDERPMapOverride(cfg types.DERPConfig, nodeKey string) (*tailcfg.DERPMap, error) {
 	timeoutMs := cfg.DashboardTimeoutMs
 	if timeoutMs <= 0 {
