@@ -30,6 +30,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/mapper"
 	"github.com/juanfont/headscale/hscontrol/state"
+	"github.com/juanfont/headscale/hscontrol/taildrive"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -1023,9 +1024,15 @@ func (h *Headscale) DerpPokeHandler(w http.ResponseWriter, req *http.Request) {
 	nodeKey := req.URL.Query().Get("nodeKey")
 	if nodeKey != "" {
 		derp.InvalidatePatchCache(nodeKey)
+		taildrive.Invalidate(nodeKey)
 	} else {
 		derp.InvalidateAllPatchCache()
+		taildrive.InvalidateAll()
 	}
+	// NOTE: change.DERPSet triggers a re-map; Taildrive self-attrs + CapGrants are
+	// re-fetched on the next full map build (also within the 30s cache TTL). If
+	// instant filter propagation proves insufficient, escalate to a full/policy
+	// change here — verify in the M0 integration spike.
 	h.Change(change.DERPSet)
 
 	w.WriteHeader(http.StatusNoContent)

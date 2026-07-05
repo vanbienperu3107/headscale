@@ -9,6 +9,7 @@ import (
 	"github.com/juanfont/headscale/hscontrol/derp"
 	"github.com/juanfont/headscale/hscontrol/dns"
 	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/taildrive"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/views"
@@ -87,6 +88,22 @@ func (b *MapResponseBuilder) WithSelfNode() *MapResponseBuilder {
 	if err != nil {
 		b.addError(err)
 		return b
+	}
+
+	// Feature: dashboard-managed Taildrive (folder share) self node attributes
+	// (drive:share / drive:access). Mirrors WithDERPMap/WithDNSConfig patching:
+	// fetched per-node from the CMS, fail-open, cached ~30s.
+	if b.mapper.cfg.DERP.DashboardEnabled {
+		if td := taildrive.Get(b.mapper.cfg.DERP, nv.NodeKey().String()); td != nil {
+			if caps := td.NodeCaps(); len(caps) > 0 {
+				if tailnode.CapMap == nil {
+					tailnode.CapMap = tailcfg.NodeCapMap{}
+				}
+				for _, c := range caps {
+					tailnode.CapMap[c] = []tailcfg.RawMessage{}
+				}
+			}
+		}
 	}
 
 	b.resp.Node = tailnode
@@ -222,6 +239,16 @@ func (b *MapResponseBuilder) WithPacketFilters() *MapResponseBuilder {
 	// Currently, we do not send incremental package filters, however using the
 	// new PacketFilters field and "base" allows us to send a full update when we
 	// have to send an empty list, avoiding the hack in the else block.
+	// Feature: dashboard-managed Taildrive folder-share CapGrants for this node.
+	// Owner side: cap "tailscale.com/cap/drive" from each grantee (authorises
+	// access). Grantee side: cap "tailscale.com/cap/drive-sharer" from each owner
+	// (marks it a mountable remote). Fail-open, cached ~30s.
+	if b.mapper.cfg.DERP.DashboardEnabled {
+		if td := taildrive.Get(b.mapper.cfg.DERP, node.NodeKey().String()); td != nil {
+			filter = append(filter, td.FilterRules(node.Prefixes())...)
+		}
+	}
+
 	b.resp.PacketFilters = map[string][]tailcfg.FilterRule{
 		"base": filter,
 	}
