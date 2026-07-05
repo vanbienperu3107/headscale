@@ -2549,3 +2549,58 @@ func TestBatcherMultiConnection(t *testing.T) {
 		})
 	}
 }
+
+// TestBatcherSendChangeToDoesNotBroadcast guards the regression a prior
+// review found in the dashboard "poke" endpoint: change.FullSelf(id) sent
+// via AddWork (i.e. through addToBatch) is broadcast to EVERY connected
+// node, because addToBatch's HasFull short-circuit fires for any
+// change.Full-typed ChangeSet before ChangeSet.SelfUpdateOnly/NodeID are ever
+// consulted — see addToBatch's doc comment. SendChangeTo exists specifically
+// to deliver a full/self rebuild to ONLY the targeted node, bypassing
+// AddWork/addToBatch entirely. This test proves that property: the targeted
+// node receives the rebuild, and a second, unrelated connected node receives
+// nothing at all.
+func TestBatcherSendChangeToDoesNotBroadcast(t *testing.T) {
+	for _, batcherFunc := range allBatcherFunctions {
+		t.Run(batcherFunc.name, func(t *testing.T) {
+			testData, cleanup := setupBatcherWithTestData(t, batcherFunc.fn, 1, 2, 8)
+			defer cleanup()
+
+			batcher := testData.Batcher
+			tn := testData.Nodes[0]
+			tn2 := testData.Nodes[1]
+
+			batcher.AddNode(tn.n.ID, tn.ch, 100)
+			batcher.AddNode(tn2.n.ID, tn2.ch, 100)
+
+			// Drain each node's initial-connect map (and tn's "tn2 came
+			// online" notification) so they aren't mistaken for the change
+			// under test below.
+			drainChannelTimeout(tn.ch, "tn before SendChangeTo", 300*time.Millisecond)
+			drainChannelTimeout(tn2.ch, "tn2 before SendChangeTo", 300*time.Millisecond)
+
+			err := batcher.SendChangeTo(tn.n.ID, change.FullSelf(tn.n.ID))
+			require.NoError(t, err)
+
+			// The targeted node must receive the rebuild.
+			select {
+			case data := <-tn.ch:
+				assert.NotNil(t, data)
+			case <-time.After(500 * time.Millisecond):
+				t.Error("targeted node did not receive the SendChangeTo rebuild")
+			}
+
+			// The OTHER connected node must receive NOTHING — the exact
+			// property change.FullSelf via AddWork violates.
+			select {
+			case data := <-tn2.ch:
+				t.Errorf("non-targeted node received an unexpected update (broadcast leak): %+v", data)
+			case <-time.After(300 * time.Millisecond):
+				// Expected: nothing arrives.
+			}
+
+			// A node that was never connected must no-op, not error.
+			require.NoError(t, batcher.SendChangeTo(types.NodeID(999999), change.FullSelf(types.NodeID(999999))))
+		})
+	}
+}

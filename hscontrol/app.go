@@ -1014,12 +1014,14 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 // NodeKeyExpiry (routed to selfMapResponse, which covers self-attrs but NOT
 // the packet filter). change.DERP is routed to derpMapResponse, a DERPMap-only
 // patch that never touches either. So when nodeKey is resolvable to a
-// connected node, additionally send change.FullSelf(id) — a full rebuild
-// targeted at just that one node (SelfUpdateOnly), which re-reads taildrive
-// state for both self node-attrs and CapGrants. Best-effort: if the node
-// isn't currently known/connected, the cache invalidation above still makes
-// the NEXT map build for it correct, so a resolve failure is silently
-// tolerated rather than erroring the request.
+// connected node, additionally push a change.FullSelf(id) rebuild directly to
+// that node via mapBatcher.SendChangeTo — NOT via h.Change/AddWork, which
+// would broadcast a full rebuild to every connected node instead of just this
+// one (addToBatch's HasFull short-circuit ignores ChangeSet.SelfUpdateOnly;
+// see its doc comment in mapper/batcher_lockfree.go). Best-effort: if the
+// node isn't currently known/connected, SendChangeTo no-ops and the cache
+// invalidation above still makes the NEXT map build for it correct, so a
+// resolve failure is silently tolerated rather than erroring the request.
 func (h *Headscale) DerpPokeHandler(w http.ResponseWriter, req *http.Request) {
 	if !h.cfg.DERP.DashboardEnabled {
 		http.Error(w, "dashboard integration disabled", http.StatusNotFound)
@@ -1040,7 +1042,10 @@ func (h *Headscale) DerpPokeHandler(w http.ResponseWriter, req *http.Request) {
 		var nk key.NodePublic
 		if err := nk.UnmarshalText([]byte(nodeKey)); err == nil {
 			if nv, ok := h.state.GetNodeByNodeKey(nk); ok {
-				h.Change(change.FullSelf(nv.ID()))
+				id := nv.ID()
+				if err := h.mapBatcher.SendChangeTo(id, change.FullSelf(id)); err != nil {
+					log.Warn().Err(err).Uint64("node.id", id.Uint64()).Msg("derp/poke: pushing full self rebuild failed")
+				}
 			}
 		}
 	} else {
@@ -1049,8 +1054,8 @@ func (h *Headscale) DerpPokeHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	// Reuses the same change.DERPSet broadcast the periodic DERP ticker uses
 	// (scheduledTasks) — kept unconditionally so the poke-all path (no
-	// nodeKey, which has no single node to target with FullSelf) and any
-	// other existing caller keep their prior DERP-refresh behavior unchanged.
+	// nodeKey, which has no single node to target) and any other existing
+	// caller keep their prior tailnet-wide DERP-refresh behavior unchanged.
 	h.Change(change.DERPSet)
 
 	w.WriteHeader(http.StatusNoContent)

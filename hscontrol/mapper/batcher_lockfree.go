@@ -284,6 +284,15 @@ func (b *LockFreeBatcher) queueWork(w work) {
 }
 
 // addToBatch adds a change to the pending batch.
+//
+// IMPORTANT: any change.Full or change.Policy ChangeSet is broadcast to
+// EVERY connected node by the short-circuit below, regardless of
+// ChangeSet.NodeID/SelfUpdateOnly — those fields are only consulted in the
+// non-full path further down (via change.SplitAllAndSelf). A
+// change.FullSelf(id) passed to AddWork therefore does NOT target just id;
+// it forces a full rebuild tailnet-wide. To push a full/self rebuild at
+// exactly one node without that broadcast, use Batcher.SendChangeTo instead
+// of AddWork/Change.
 func (b *LockFreeBatcher) addToBatch(c ...change.ChangeSet) {
 	// Short circuit if any of the changes is a full update, which
 	// means we can skip sending individual changes.
@@ -447,6 +456,24 @@ func (b *LockFreeBatcher) MapResponseFromChange(id types.NodeID, c change.Change
 	case <-b.ctx.Done():
 		return nil, fmt.Errorf("batcher shutting down while generating map response for node %d", id)
 	}
+}
+
+// SendChangeTo generates and delivers a MapResponse for c directly to id's
+// active connections via that node's multiChannelNodeConn.change (generate +
+// send in one step, the same path AddNode's initial-connect send effectively
+// mirrors) — entirely bypassing AddWork/addToBatch, so a change.Full/Policy
+// ChangeSet does NOT get broadcast to every connected node the way it would
+// through addToBatch's HasFull short-circuit (see addToBatch's doc comment).
+// No-op if id isn't currently connected — the caller's own cache
+// invalidation (if any) should already make that node's next real map build
+// correct, so a disconnected node here is not an error.
+func (b *LockFreeBatcher) SendChangeTo(id types.NodeID, c change.ChangeSet) error {
+	nodeConn, ok := b.nodes.Load(id)
+	if !ok {
+		return nil
+	}
+
+	return nodeConn.change(c)
 }
 
 // connectionEntry represents a single connection to a node.

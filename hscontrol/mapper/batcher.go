@@ -26,6 +26,14 @@ type Batcher interface {
 	ConnectedMap() *xsync.Map[types.NodeID, bool]
 	AddWork(c ...change.ChangeSet)
 	MapResponseFromChange(id types.NodeID, c change.ChangeSet) (*tailcfg.MapResponse, error)
+	// SendChangeTo generates and delivers a MapResponse for c directly to id's
+	// active connections, entirely bypassing AddWork/addToBatch. Use this when
+	// a ChangeSet's usual blast radius is wrong for the caller's intent — in
+	// particular, addToBatch broadcasts ANY change.Full/change.Policy to every
+	// connected node (see change.HasFull), ignoring ChangeSet.SelfUpdateOnly,
+	// so there is no way to route a single-node full rebuild through AddWork.
+	// No-op (nil, not an error) if id isn't currently connected.
+	SendChangeTo(id types.NodeID, c change.ChangeSet) error
 	DebugMapResponses() (map[types.NodeID][]tailcfg.MapResponse, error)
 }
 
