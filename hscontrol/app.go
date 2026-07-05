@@ -1002,13 +1002,24 @@ func readOrCreatePrivateKey(path string) (*key.MachinePrivate, error) {
 }
 
 // DerpPokeHandler forces an immediate refresh of a node's per-node DERPMap
-// override and broadcasts a DERP change so the node re-polls promptly, instead
-// of waiting for the 30s patch cache to expire. It reuses the same
-// change.DERPSet broadcast the periodic DERP ticker uses (scheduledTasks);
-// nodes whose override is unchanged simply hit their cache. Guarded by the
-// shared dashboard secret.
+// override and Taildrive folder-share caps, instead of waiting for the 30s
+// patch cache to expire. Guarded by the shared dashboard secret.
 //
 //	POST /derp/poke?nodeKey=<key>   (nodeKey omitted → invalidate all overrides)
+//
+// Sending change.DERPSet alone is NOT sufficient for the Taildrive side: the
+// map batcher (mapper/batcher.go) only rebuilds WithSelfNode()/
+// WithPacketFilters() — the two builder steps that read taildrive.Get() — for
+// change.Full/Policy (routed to fullMapResponse) or a self change.NodeNewOrUpdate/
+// NodeKeyExpiry (routed to selfMapResponse, which covers self-attrs but NOT
+// the packet filter). change.DERP is routed to derpMapResponse, a DERPMap-only
+// patch that never touches either. So when nodeKey is resolvable to a
+// connected node, additionally send change.FullSelf(id) — a full rebuild
+// targeted at just that one node (SelfUpdateOnly), which re-reads taildrive
+// state for both self node-attrs and CapGrants. Best-effort: if the node
+// isn't currently known/connected, the cache invalidation above still makes
+// the NEXT map build for it correct, so a resolve failure is silently
+// tolerated rather than erroring the request.
 func (h *Headscale) DerpPokeHandler(w http.ResponseWriter, req *http.Request) {
 	if !h.cfg.DERP.DashboardEnabled {
 		http.Error(w, "dashboard integration disabled", http.StatusNotFound)
@@ -1025,14 +1036,21 @@ func (h *Headscale) DerpPokeHandler(w http.ResponseWriter, req *http.Request) {
 	if nodeKey != "" {
 		derp.InvalidatePatchCache(nodeKey)
 		taildrive.Invalidate(nodeKey)
+
+		var nk key.NodePublic
+		if err := nk.UnmarshalText([]byte(nodeKey)); err == nil {
+			if nv, ok := h.state.GetNodeByNodeKey(nk); ok {
+				h.Change(change.FullSelf(nv.ID()))
+			}
+		}
 	} else {
 		derp.InvalidateAllPatchCache()
 		taildrive.InvalidateAll()
 	}
-	// NOTE: change.DERPSet triggers a re-map; Taildrive self-attrs + CapGrants are
-	// re-fetched on the next full map build (also within the 30s cache TTL). If
-	// instant filter propagation proves insufficient, escalate to a full/policy
-	// change here — verify in the M0 integration spike.
+	// Reuses the same change.DERPSet broadcast the periodic DERP ticker uses
+	// (scheduledTasks) — kept unconditionally so the poke-all path (no
+	// nodeKey, which has no single node to target with FullSelf) and any
+	// other existing caller keep their prior DERP-refresh behavior unchanged.
 	h.Change(change.DERPSet)
 
 	w.WriteHeader(http.StatusNoContent)

@@ -95,26 +95,81 @@ func TestConfigFilterRulesEmpty(t *testing.T) {
 	}
 }
 
-func TestConfigAccessDefaultsReadWrite(t *testing.T) {
+func TestConfigAccessDefaultsReadOnly(t *testing.T) {
 	self := []netip.Prefix{netip.MustParsePrefix("100.64.0.11/32")}
-	// Missing access on a drive grant defaults to "rw" (feature ships full RW).
-	c := &Config{Grants: []Grant{{SrcIPs: []string{"100.64.0.23/32"}, Cap: "drive", Shares: []string{"s"}}}}
-	vals := c.FilterRules(self)[0].CapGrant[0].CapMap[tailcfg.PeerCapabilityTaildrive]
 	var g struct {
 		Access string `json:"access"`
 	}
-	if err := json.Unmarshal([]byte(vals[0]), &g); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	decode := func(cfg *Config) string {
+		vals := cfg.FilterRules(self)[0].CapGrant[0].CapMap[tailcfg.PeerCapabilityTaildrive]
+		if err := json.Unmarshal([]byte(vals[0]), &g); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return g.Access
 	}
-	if g.Access != "rw" {
-		t.Errorf("default access = %q, want rw", g.Access)
+
+	// Missing/garbage access on a drive grant fails CLOSED to "ro" — a
+	// dashboard bug must never silently escalate to write access.
+	for _, bad := range []string{"", "RW", "rw ", "garbage"} {
+		c := &Config{Grants: []Grant{{SrcIPs: []string{"100.64.0.23/32"}, Cap: "drive", Shares: []string{"s"}, Access: bad}}}
+		if got := decode(c); got != "ro" {
+			t.Errorf("access %q -> default %q, want ro", bad, got)
+		}
 	}
-	// Explicit "ro" is preserved.
-	c2 := &Config{Grants: []Grant{{SrcIPs: []string{"100.64.0.23/32"}, Cap: "drive", Shares: []string{"s"}, Access: "ro"}}}
-	vals2 := c2.FilterRules(self)[0].CapGrant[0].CapMap[tailcfg.PeerCapabilityTaildrive]
-	_ = json.Unmarshal([]byte(vals2[0]), &g)
-	if g.Access != "ro" {
-		t.Errorf("explicit access = %q, want ro", g.Access)
+	// Only the exact literal "rw" grants write access.
+	c := &Config{Grants: []Grant{{SrcIPs: []string{"100.64.0.23/32"}, Cap: "drive", Shares: []string{"s"}, Access: "rw"}}}
+	if got := decode(c); got != "rw" {
+		t.Errorf("explicit access = %q, want rw", got)
+	}
+}
+
+func TestValidSingleHostIPs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{"single ipv4 host kept", []string{"100.64.0.23/32"}, []string{"100.64.0.23/32"}},
+		{"single ipv6 host kept", []string{"fd7a:115c:a1e0::1/128"}, []string{"fd7a:115c:a1e0::1/128"}},
+		{"wildcard rejected", []string{"*"}, nil},
+		{"broad ipv4 subnet rejected", []string{"100.64.0.0/24"}, nil},
+		{"default route rejected", []string{"0.0.0.0/0"}, nil},
+		{"ipv6 default route rejected", []string{"::/0"}, nil},
+		{"garbage rejected", []string{"not-an-ip"}, nil},
+		{"mixed: valid kept, invalid dropped", []string{"100.64.0.23/32", "100.64.0.0/24", "*"}, []string{"100.64.0.23/32"}},
+		{"empty", nil, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := validSingleHostIPs(tt.in)
+			if len(got) != len(tt.want) {
+				t.Fatalf("validSingleHostIPs(%v) = %v, want %v", tt.in, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("validSingleHostIPs(%v)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestConfigFilterRulesRejectsWildcardSrc(t *testing.T) {
+	self := []netip.Prefix{netip.MustParsePrefix("100.64.0.11/32")}
+	// A grant whose ONLY src is a wildcard/broad CIDR must produce no rule at
+	// all (not a rule with an empty SrcIPs, which tailcfg could interpret
+	// differently) — this is the scenario a buggy/compromised dashboard could
+	// trigger to try to widen a single-grantee share tailnet-wide.
+	c := &Config{Grants: []Grant{{SrcIPs: []string{"*"}, Cap: "drive", Shares: []string{"s"}, Access: "rw"}}}
+	if r := c.FilterRules(self); len(r) != 0 {
+		t.Errorf("wildcard-only grant produced %d rules, want 0: %+v", len(r), r)
+	}
+	// A grant with one wildcard and one valid single-host src keeps only the
+	// valid one.
+	c2 := &Config{Grants: []Grant{{SrcIPs: []string{"*", "100.64.0.23/32"}, Cap: "drive", Shares: []string{"s"}, Access: "rw"}}}
+	r2 := c2.FilterRules(self)
+	if len(r2) != 1 || len(r2[0].SrcIPs) != 1 || r2[0].SrcIPs[0] != "100.64.0.23/32" {
+		t.Errorf("mixed grant = %+v, want exactly [100.64.0.23/32]", r2)
 	}
 }
 

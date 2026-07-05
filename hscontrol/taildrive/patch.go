@@ -143,7 +143,7 @@ func fetch(cfg types.DERPConfig, nodeKey string) (*Config, error) {
 		return nil, fmt.Errorf("dashboard returned %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
@@ -154,6 +154,12 @@ func fetch(cfg types.DERPConfig, nodeKey string) (*Config, error) {
 	}
 	return &out, nil
 }
+
+// maxResponseBytes bounds how much of the dashboard's response this reads —
+// generous for this payload's shape (a handful of shares/grants per node),
+// caps memory use per call regardless of how many nodes concurrently poll
+// (e.g. via /derp/poke fanning out FullSelf rebuilds).
+const maxResponseBytes = 1 << 20 // 1 MiB
 
 // NodeCaps returns the self node attributes to merge into this node's CapMap.
 func (c *Config) NodeCaps() []tailcfg.NodeCapability {
@@ -182,7 +188,8 @@ func (c *Config) FilterRules(selfPrefixes []netip.Prefix) []tailcfg.FilterRule {
 
 	rules := make([]tailcfg.FilterRule, 0, len(c.Grants))
 	for _, g := range c.Grants {
-		if len(g.SrcIPs) == 0 {
+		srcIPs := validSingleHostIPs(g.SrcIPs)
+		if len(srcIPs) == 0 {
 			continue
 		}
 		capName, value, ok := g.capValue()
@@ -190,7 +197,7 @@ func (c *Config) FilterRules(selfPrefixes []netip.Prefix) []tailcfg.FilterRule {
 			continue
 		}
 		rules = append(rules, tailcfg.FilterRule{
-			SrcIPs: g.SrcIPs,
+			SrcIPs: srcIPs,
 			CapGrant: []tailcfg.CapGrant{
 				{
 					Dsts:   dsts,
@@ -202,12 +209,36 @@ func (c *Config) FilterRules(selfPrefixes []netip.Prefix) []tailcfg.FilterRule {
 	return rules
 }
 
+// validSingleHostIPs filters ips down to single-host CIDRs ("/32" IPv4 or
+// "/128" IPv6) — the only shape a folder-share grant's src should ever take,
+// since each grant targets one specific peer, never a subnet. Rejects the
+// literal wildcard "*" (tailcfg.FilterRule.SrcIPs treats it as "match
+// everything") and anything broader than a single host, so a buggy or
+// compromised dashboard response can't silently widen a single-grantee share
+// to the whole tailnet.
+func validSingleHostIPs(ips []string) []string {
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		p, err := netip.ParsePrefix(ip)
+		if err != nil || p.Bits() != p.Addr().BitLen() {
+			log.Warn().Str("src_ip", ip).Msg("taildrive/patch: rejecting non-single-host src_ip in grant")
+			continue
+		}
+		out = append(out, ip)
+	}
+	return out
+}
+
 // capValue maps a grant to its tailcfg capability name and raw JSON value.
 func (g Grant) capValue() (tailcfg.PeerCapability, []tailcfg.RawMessage, bool) {
 	switch g.Cap {
 	case capDrive:
-		access := g.Access
-		if access != "ro" {
+		// Fail CLOSED toward the least-privileged outcome: only the exact
+		// literal "rw" grants write access. A missing/typo'd/garbage value
+		// (dashboard bug, not "ro") defaults to read-only rather than
+		// silently escalating to read-write.
+		access := "ro"
+		if g.Access == "rw" {
 			access = "rw"
 		}
 		val, err := json.Marshal(struct {
