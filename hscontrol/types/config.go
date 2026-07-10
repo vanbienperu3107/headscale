@@ -264,6 +264,15 @@ type DERPConfig struct {
 	DashboardURL       string // e.g. https://dashboard.hangocthanh.io.vn
 	DashboardSecret    string // X-Headscale-Secret header value
 	DashboardTimeoutMs int    // HTTP call timeout in milliseconds (default 500)
+
+	// PinReconcileMode gates the IP-pin consistency reconciler (see
+	// docs/plan-ip-pin-consistency.md): "off" (default) behaves exactly as
+	// upstream — no dashboard pin=1 call, no recreate/consolidation logic.
+	// "dryrun" fetches the pin and logs the decision it would make but
+	// never mutates NodeStore/DB/ipAlloc. "on" acts on the decision:
+	// recreates a drifted node at its pinned IPv4 and consolidates other
+	// self nodes sharing the machine key. Any other value is treated as "off".
+	PinReconcileMode string
 }
 
 type LogTailConfig struct {
@@ -454,6 +463,8 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("dns.nameservers.global", []string{})
 	viper.SetDefault("dns.nameservers.split", map[string]string{})
 	viper.SetDefault("dns.search_domains", []string{})
+
+	viper.SetDefault("derp.pin_reconcile.mode", "off")
 
 	viper.SetDefault("derp.server.enabled", false)
 	viper.SetDefault("derp.server.verify_clients", true)
@@ -805,6 +816,8 @@ func derpConfig() DERPConfig {
 		DashboardURL:       viper.GetString("derp.dashboard.url"),
 		DashboardSecret:    viper.GetString("derp.dashboard.secret"),
 		DashboardTimeoutMs: viper.GetInt("derp.dashboard.timeout_ms"),
+		// IP-pin consistency reconciler (docs/plan-ip-pin-consistency.md)
+		PinReconcileMode: viper.GetString("derp.pin_reconcile.mode"),
 	}
 }
 

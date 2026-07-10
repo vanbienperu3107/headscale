@@ -300,6 +300,59 @@ func TestChange_Merge(t *testing.T) {
 	}
 }
 
+// TestChange_Merge_PinReconcileScenario exercises the exact fold shape the
+// IP-pin consistency reconciler needs (docs/plan-ip-pin-consistency.md §2
+// mergeWithPolicy: several [NodeRemoved] for the self nodes a RE-PIN
+// recreate replaces, one [NodeAdded] for the new node, folded left-to-right
+// with .Merge, optionally topped off with a [PolicyChange]). NodeAdded and
+// NodeRemoved both have TargetNode==0 (see [Change.Merge]'s TargetNode
+// panic guard), so folding several of each together must never panic and
+// must produce the union of every removed peer plus the added one.
+func TestChange_Merge_PinReconcileScenario(t *testing.T) {
+	t.Run("NodeAdded folded with multiple NodeRemoved, no policy change", func(t *testing.T) {
+		merged := NodeAdded(10)
+		for _, removed := range []types.NodeID{1, 2, 3} {
+			merged = merged.Merge(NodeRemoved(removed))
+		}
+
+		assert.Equal(t, []types.NodeID{1, 2, 3}, merged.PeersRemoved)
+		assert.Equal(t, []types.NodeID{10}, merged.PeersChanged)
+		assert.Equal(t, types.NodeID(10), merged.OriginNode)
+		assert.Equal(t, types.NodeID(0), merged.TargetNode)
+		assert.False(t, merged.IsEmpty())
+	})
+
+	t.Run("NodeAdded folded with multiple NodeRemoved, plus a PolicyChange", func(t *testing.T) {
+		merged := NodeAdded(10)
+		for _, removed := range []types.NodeID{4, 5} {
+			merged = merged.Merge(NodeRemoved(removed))
+		}
+
+		merged = merged.Merge(PolicyChange())
+
+		assert.Equal(t, []types.NodeID{4, 5}, merged.PeersRemoved)
+		assert.Equal(t, []types.NodeID{10}, merged.PeersChanged)
+		assert.True(t, merged.IncludePolicy)
+		assert.True(t, merged.RequiresRuntimePeerComputation)
+		assert.Equal(t, types.NodeID(10), merged.OriginNode)
+	})
+
+	t.Run("duplicate NodeRemoved for the same node is deduplicated", func(t *testing.T) {
+		merged := NodeRemoved(7).Merge(NodeRemoved(7)).Merge(NodeAdded(8))
+
+		assert.Equal(t, []types.NodeID{7}, merged.PeersRemoved)
+		assert.Equal(t, []types.NodeID{8}, merged.PeersChanged)
+	})
+
+	t.Run("order independence: removals-then-add equals add-then-removals", func(t *testing.T) {
+		a := NodeRemoved(1).Merge(NodeRemoved(2)).Merge(NodeAdded(3))
+		b := NodeAdded(3).Merge(NodeRemoved(1)).Merge(NodeRemoved(2))
+
+		assert.Equal(t, a.PeersRemoved, b.PeersRemoved)
+		assert.Equal(t, a.PeersChanged, b.PeersChanged)
+	})
+}
+
 func TestChange_IsBroadcastPolicyChange(t *testing.T) {
 	originUpdate := PolicyChange()
 	originUpdate.OriginNode = 7

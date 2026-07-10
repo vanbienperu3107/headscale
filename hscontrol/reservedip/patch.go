@@ -27,7 +27,19 @@ import (
 // dns/patch.go. Fail-open: any error, non-200, empty body, or unparsable
 // address returns (netip.Addr{}, false) so the caller falls back to normal
 // IPAllocator.Next() — this must never block registration.
-func FetchReservedIP(dashboardURL, dashboardSecret, mac string, timeoutMs int) (netip.Addr, bool) {
+//
+// pin selects the IP-pin-consistency reconciler's contract (see
+// docs/plan-ip-pin-consistency.md §10 B1/B2): when true, "&pin=1" is
+// appended and the dashboard (a) suppresses its async stale-node reap for
+// this lookup and (b) returns only the admin-set static_ipv4 (never
+// last_ipv4, which is client-reported and can drift). Callers must only
+// pass pin=true when the reconciler is fully authoritative for this
+// machine's IP (mode=="on"); passing pin=true while mode!="on" would
+// silently disable the dashboard's own reap without headscale's reconciler
+// taking over, leaving stale nodes never cleaned up. A stock/legacy caller
+// that omits pin (pin=false) gets the historical static||last_ipv4 +
+// async-reap behaviour unchanged.
+func FetchReservedIP(dashboardURL, dashboardSecret, mac string, timeoutMs int, pin bool) (netip.Addr, bool) {
 	if dashboardURL == "" || mac == "" {
 		return netip.Addr{}, false
 	}
@@ -36,6 +48,9 @@ func FetchReservedIP(dashboardURL, dashboardSecret, mac string, timeoutMs int) (
 	}
 
 	url := fmt.Sprintf("%s/api/internal/reserved-ip?mac=%s", dashboardURL, mac)
+	if pin {
+		url += "&pin=1"
+	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return netip.Addr{}, false
