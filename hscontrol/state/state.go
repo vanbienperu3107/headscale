@@ -1654,6 +1654,21 @@ type newNodeParams struct {
 
 	// Optional: Existing node for netinfo preservation
 	ExistingNodeForNetinfo types.NodeView
+
+	// Optional: pre-resolved/pre-reserved pinned IPv4 (set only by the
+	// pin-reconcile recreate path, see docs/plan-ip-pin-consistency.md
+	// §2/§3). When non-nil, [State.allocateNodeIPs] uses it directly for
+	// IPv4 — skipping FetchReservedIP/Reserve/Next for the v4 address
+	// entirely, since the caller already resolved (and, if needed,
+	// reserved) it — and still allocates IPv6 via Next().
+	IPv4Reserved *netip.Addr
+
+	// Optional: carry admin-set ApprovedRoutes/GivenName across a
+	// pin-reconcile recreate, so re-pinning a node never loses config an
+	// admin set on the node it replaces. Both are zero-value (empty
+	// slice/"") for an ordinary new-node registration.
+	ApprovedRoutesCarry []netip.Prefix
+	GivenNameCarry      string
 }
 
 // authNodeUpdateParams contains parameters for updating an existing node during auth.
@@ -1852,18 +1867,38 @@ func (s *State) applyAuthNodeUpdate(params authNodeUpdateParams) (types.NodeView
 
 // createAndSaveNewNode creates a new node, allocates IPs, saves to DB, and adds to [NodeStore].
 // It preserves netinfo from an existing node if one is provided (for faster DERP connectivity).
-// allocateNodeIPs picks IPv4/IPv6 for a newly-registering node. If the client
-// reported a primary MAC via Hostinfo.WoLMACs[0] (tailscale_mod client only —
-// a stock/default build never sets this, so this path is a no-op for it) and
-// the CMS dashboard has a reserved/historical IP for that MAC, the reserved
-// IPv4 is used instead of a fresh one from IPAllocator.Next() — this only
-// overrides IPv4, IPv6 always comes from the normal allocator. Fail-open at
-// every step (no MAC, dashboard unreachable, no reservation, or the reserved
-// address already taken by another node): falls back to Next() silently,
-// registration is never blocked by this.
-func (s *State) allocateNodeIPs(hostinfo *tailcfg.Hostinfo) (*netip.Addr, *netip.Addr, error) {
+// allocateNodeIPs picks IPv4/IPv6 for a newly-registering node. ipv4Reserved,
+// when non-nil, is used directly for IPv4 (the pin-reconcile recreate path
+// already resolved — and, if needed, reserved — this address itself; see
+// docs/plan-ip-pin-consistency.md §2/§3), skipping FetchReservedIP/Reserve/
+// Next for v4 entirely; IPv6 is still always allocated via Next(). Otherwise,
+// if the client reported a primary MAC via Hostinfo.WoLMACs[0] (tailscale_mod
+// client only — a stock/default build never sets this, so this path is a
+// no-op for it) and the CMS dashboard has a reserved/historical IP for that
+// MAC, the reserved IPv4 is used instead of a fresh one from
+// IPAllocator.Next() — this only overrides IPv4, IPv6 always comes from the
+// normal allocator. Fail-open at every step (no MAC, dashboard unreachable,
+// no reservation, or the reserved address already taken by another node):
+// falls back to Next() silently, registration is never blocked by this.
+func (s *State) allocateNodeIPs(hostinfo *tailcfg.Hostinfo, ipv4Reserved *netip.Addr) (*netip.Addr, *netip.Addr, error) {
+	if ipv4Reserved != nil {
+		_, ipv6, err := s.ipAlloc.Next()
+		if err != nil {
+			return nil, nil, fmt.Errorf("allocating IPv6 for pinned IPv4: %w", err)
+		}
+
+		return ipv4Reserved, ipv6, nil
+	}
+
 	if mac := primaryMACFromHostinfo(hostinfo); mac != "" {
-		if addr, ok := reservedip.FetchReservedIP(s.cfg.DERP.DashboardURL, s.cfg.DERP.DashboardSecret, mac, s.cfg.DERP.DashboardTimeoutMs); ok {
+		// This opportunistic fetch is unrelated to the pin-reconcile
+		// mode gate: it is the pre-existing MAC-based static/historical
+		// IP feature, always using the legacy dashboard contract (no
+		// "&pin=1", static||last_ipv4 + async reap unaffected). The
+		// reconciler's own fetch (mode-gated, pin=="on") happens earlier,
+		// in [State.tryPinReconcile], and threads its result through
+		// ipv4Reserved above instead of through this call.
+		if addr, ok := reservedip.FetchReservedIP(s.cfg.DERP.DashboardURL, s.cfg.DERP.DashboardSecret, mac, s.cfg.DERP.DashboardTimeoutMs, false); ok {
 			if ipv4, err := s.ipAlloc.Reserve(addr); err == nil {
 				_, ipv6, err := s.ipAlloc.Next()
 				if err != nil {
@@ -1889,6 +1924,48 @@ func primaryMACFromHostinfo(hostinfo *tailcfg.Hostinfo) string {
 }
 
 func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, error) {
+	nodeToRegister, err := s.buildNodeRow(params)
+	if err != nil {
+		return types.NodeView{}, err
+	}
+
+	// New node - database first to get ID, then [NodeStore]
+	savedNode, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
+		err := tx.Save(nodeToRegister).Error
+		if err != nil {
+			return nil, fmt.Errorf("saving node: %w", err)
+		}
+
+		if params.PreAuthKey != nil && !params.PreAuthKey.Reusable {
+			err := hsdb.UsePreAuthKey(tx, params.PreAuthKey)
+			if err != nil {
+				return nil, fmt.Errorf("using pre auth key: %w", err)
+			}
+		}
+
+		return nodeToRegister, nil
+	})
+	if err != nil {
+		return types.NodeView{}, err
+	}
+
+	// Add to [NodeStore] after database creates the ID
+	return s.nodeStore.PutNode(*savedNode), nil
+}
+
+// buildNodeRow constructs (but does not persist) a new [types.Node] from
+// params: ownership (PreAuthKey or User), tag/expiry rules, IP allocation
+// (via [State.allocateNodeIPs] — params.IPv4Reserved pins IPv4 without a
+// fresh dashboard/allocator round-trip), and GivenName/ApprovedRoutes
+// carry-over from params.GivenNameCarry/params.ApprovedRoutesCarry (both
+// zero-value for an ordinary new-node registration, so behaviour is
+// unchanged when unset). Extracted out of [State.createAndSaveNewNode] so
+// the pin-reconcile recreate path ([State.reconcileRecreate],
+// pin_reconcile.go) can build the same node row and insert it in the SAME
+// database transaction as the deletes it replaces (see
+// docs/plan-ip-pin-consistency.md §2/§3, finding F-C) — createAndSaveNewNode
+// itself still runs its own independent transaction, unchanged.
+func (s *State) buildNodeRow(params newNodeParams) (*types.Node, error) {
 	// Preserve NetInfo from existing node if available
 	if params.Hostinfo != nil {
 		params.Hostinfo.NetInfo = preserveNetInfo(
@@ -1909,7 +1986,7 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 	// time and reject before allocating any resources.
 	if existing, ok := s.nodeStore.GetNodeByNodeKey(params.NodeKey); ok &&
 		existing.MachineKey() != params.MachineKey {
-		return types.NodeView{}, ErrNodeKeyInUse
+		return nil, ErrNodeKeyInUse
 	}
 
 	// Prepare the node for registration
@@ -1924,6 +2001,12 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		IsOnline:       new(false), // Explicitly offline until [State.Connect] is called
 		RegisterMethod: params.RegisterMethod,
 		Expiry:         params.Expiry,
+		// Carried from the node being replaced by a pin-reconcile recreate,
+		// if any (docs/plan-ip-pin-consistency.md §1 invariant: admin config
+		// must survive a re-pin). GivenName is only set here when non-empty;
+		// the sanitised-hostname fallback below leaves a carried value alone.
+		ApprovedRoutes: types.Prefixes(params.ApprovedRoutesCarry),
+		GivenName:      params.GivenNameCarry,
 	}
 
 	// Assign ownership based on PreAuthKey
@@ -1954,7 +2037,7 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 	// Reject advertise-tags for PreAuthKey registrations early, before any resource allocation.
 	// PreAuthKey nodes get their tags from the key itself, not from client requests.
 	if params.PreAuthKey != nil && params.Hostinfo != nil && len(params.Hostinfo.RequestTags) > 0 {
-		return types.NodeView{}, fmt.Errorf("%w %v are invalid or not permitted", ErrRequestedTagsInvalidOrNotPermitted, params.Hostinfo.RequestTags)
+		return nil, fmt.Errorf("%w %v are invalid or not permitted", ErrRequestedTagsInvalidOrNotPermitted, params.Hostinfo.RequestTags)
 	}
 
 	// Process RequestTags (from tailscale up --advertise-tags) ONLY for non-PreAuthKey registrations.
@@ -1963,7 +2046,7 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 		// Validate all tags before applying - reject if any tag is not permitted
 		rejectedTags := s.validateRequestTags(nodeToRegister.View(), params.Hostinfo.RequestTags)
 		if len(rejectedTags) > 0 {
-			return types.NodeView{}, fmt.Errorf("%w %v are invalid or not permitted", ErrRequestedTagsInvalidOrNotPermitted, rejectedTags)
+			return nil, fmt.Errorf("%w %v are invalid or not permitted", ErrRequestedTagsInvalidOrNotPermitted, rejectedTags)
 		}
 
 		// All tags are approved - apply them
@@ -2002,49 +2085,32 @@ func (s *State) createAndSaveNewNode(params newNodeParams) (types.NodeView, erro
 	// Validate before saving
 	err := validateNodeOwnership(&nodeToRegister)
 	if err != nil {
-		return types.NodeView{}, err
+		return nil, err
 	}
 
 	// Allocate new IPs — a MAC-based static/historical reservation from the
-	// CMS dashboard (see allocateNodeIPs) takes priority over a fresh
-	// Next() allocation, letting a reinstalled device keep its old address.
-	ipv4, ipv6, err := s.allocateNodeIPs(params.Hostinfo)
+	// CMS dashboard (see allocateNodeIPs), or the pin-reconcile recreate
+	// path's already-resolved pin (params.IPv4Reserved), takes priority over
+	// a fresh Next() allocation, letting a reinstalled/re-pinned device keep
+	// its address.
+	ipv4, ipv6, err := s.allocateNodeIPs(params.Hostinfo, params.IPv4Reserved)
 	if err != nil {
-		return types.NodeView{}, fmt.Errorf("allocating IPs: %w", err)
+		return nil, fmt.Errorf("allocating IPs: %w", err)
 	}
 
 	nodeToRegister.IPv4 = ipv4
 	nodeToRegister.IPv6 = ipv6
 
 	// Seed GivenName from the sanitised raw hostname. [NodeStore.PutNode]
-	// bumps on collision and falls back to "node" if the sanitised
-	// result is empty (pure non-ASCII / punctuation input).
+	// (or [NodeStore.SwapNode]) bumps on collision and falls back to "node"
+	// if the sanitised result is empty (pure non-ASCII / punctuation input).
+	// A carried GivenName (set in the struct literal above) is already
+	// non-empty, so this leaves it untouched.
 	if nodeToRegister.GivenName == "" {
 		nodeToRegister.GivenName = dnsname.SanitizeHostname(nodeToRegister.Hostname)
 	}
 
-	// New node - database first to get ID, then [NodeStore]
-	savedNode, err := hsdb.Write(s.db.DB, func(tx *gorm.DB) (*types.Node, error) {
-		err := tx.Save(&nodeToRegister).Error
-		if err != nil {
-			return nil, fmt.Errorf("saving node: %w", err)
-		}
-
-		if params.PreAuthKey != nil && !params.PreAuthKey.Reusable {
-			err := hsdb.UsePreAuthKey(tx, params.PreAuthKey)
-			if err != nil {
-				return nil, fmt.Errorf("using pre auth key: %w", err)
-			}
-		}
-
-		return &nodeToRegister, nil
-	})
-	if err != nil {
-		return types.NodeView{}, err
-	}
-
-	// Add to [NodeStore] after database creates the ID
-	return s.nodeStore.PutNode(*savedNode), nil
+	return &nodeToRegister, nil
 }
 
 // validateRequestTags validates that the requested tags are permitted for the node.
@@ -2225,6 +2291,57 @@ func (s *State) HandleNodeFromAuthPath(
 		return types.NodeView{}, change.Change{}, ErrAmbiguousNodeOwnership
 	}
 
+	// IP-pin consistency reconciler (docs/plan-ip-pin-consistency.md §2).
+	// Skipped entirely for a tagged-conversion registration
+	// (existingNodeIsTagged): reconcile never reclaims or self-heals a
+	// tagged node (§4/§9.4), and that branch has no "me" under
+	// registeringUID to evaluate against pin anyway. A zero-value
+	// pinOutcome (mode=="off", the default) costs nothing beyond the
+	// boolean checks in [State.tryPinReconcile].
+	var pinInfo pinOutcome
+
+	if !existingNodeIsTagged {
+		pinInfo = s.tryPinReconcile(all, types.UserID(user.ID), hostinfo, newNodeParams{
+			User:           *user,
+			MachineKey:     machineKey,
+			NodeKey:        regData.NodeKey,
+			DiscoKey:       regData.DiscoKey,
+			Hostname:       hostname,
+			Hostinfo:       hostinfo,
+			Endpoints:      regData.Endpoints,
+			Expiry:         cmp.Or(expiry, regData.Expiry),
+			RegisterMethod: registrationMethod,
+		})
+		if pinInfo.handled {
+			// RE-PIN recreate already produced the complete result:
+			// signal/cleanup exactly like the epilogue below, but with the
+			// reconcile-computed node/change instead of the normal
+			// applyAuthNodeUpdate/createNewNodeFromAuth + reauthChange path.
+			regEntry.FinishAuth(types.AuthVerdict{Node: pinInfo.node})
+			s.authCache.Remove(authID)
+
+			finalChange := pinInfo.change
+
+			usersChange, err := s.updatePolicyManagerUsers()
+			if err != nil {
+				return pinInfo.node, finalChange, fmt.Errorf("updating policy manager users: %w", err)
+			}
+			if !usersChange.IsEmpty() {
+				finalChange = finalChange.Merge(usersChange)
+			}
+
+			nodesChange, err := s.updatePolicyManagerNodes()
+			if err != nil {
+				return pinInfo.node, finalChange, fmt.Errorf("updating policy manager nodes: %w", err)
+			}
+			if !nodesChange.IsEmpty() {
+				finalChange = finalChange.Merge(nodesChange)
+			}
+
+			return pinInfo.node, finalChange, nil
+		}
+	}
+
 	// Create logger with common fields for all auth operations
 	logger := log.With().
 		Str(zf.RegistrationID, authID.String()).
@@ -2310,10 +2427,26 @@ func (s *State) HandleNodeFromAuthPath(
 
 	policyChanged := !usersChange.IsEmpty() || !nodesChange.IsEmpty()
 
+	// pin-reconcile "newest wins" consolidation (docs/plan-ip-pin-consistency.md
+	// §1/§2/§3): only runs when mode=="on" and reconcile did not already
+	// bypass this function above. A CHEAP/KEEP decision leaves other self
+	// nodes (other users sharing this machineKey) untouched by the normal
+	// path above; this deletes them now that finalNode is confirmed.
+	var extraRemovals []change.Change
+
+	if !existingNodeIsTagged && s.cfg.DERP.PinReconcileMode == "on" {
+		extraRemovals = s.reconcileDeleteSelf(all, finalNode.ID(), pinInfo.pin, pinInfo.pinOK)
+	}
+
 	// nodeExistsForSameUser is true only for a same-user relogin; a tag->user
 	// conversion is excluded, as it changes the peer's User — a structural
 	// change peers must see in full, not a key-rotation patch.
-	return finalNode, reauthChange(finalNode, nodeExistsForSameUser, policyChanged), nil
+	finalChange := reauthChange(finalNode, nodeExistsForSameUser, policyChanged)
+	for _, r := range extraRemovals {
+		finalChange = finalChange.Merge(r)
+	}
+
+	return finalNode, finalChange, nil
 }
 
 // createNewNodeFromAuth creates a new node during auth callback.
@@ -2425,6 +2558,13 @@ func (s *State) HandleNodeFromPreAuthKey(
 		return types.NodeView{}, change.Change{}, err
 	}
 
+	// This machine's own nodes (tagged under UserID(0)), fetched once and
+	// reused below both by [State.tryPinReconcile]/[State.reconcileDeleteSelf]
+	// (docs/plan-ip-pin-consistency.md §2) and, further down, by the
+	// existing belongsToDifferentUser check — that check re-fetches its own
+	// snapshot independently and is left untouched.
+	all := s.nodeStore.GetNodesByMachineKeyAllUsers(machineKey)
+
 	// Helper to get username for logging (handles nil User for tags-only keys)
 	pakUsername := func() string {
 		if pak.User != nil {
@@ -2514,6 +2654,61 @@ func (s *State) HandleNodeFromPreAuthKey(
 		Str(zf.NodeKey, regReq.NodeKey.ShortString()).
 		Str(zf.UserName, pakUsername()).
 		Msg("Registering node with pre-auth key")
+
+	// IP-pin consistency reconciler (docs/plan-ip-pin-consistency.md §2).
+	// Skipped entirely for anything tagged-related: a tags-only key
+	// (pak.User == nil), a tagged key (pak.IsTagged()), or a same-user
+	// match that turned out to be a formerly-tagged node
+	// ([State.findExistingNodeForPAK]'s SetNodeTags-conversion fallback) —
+	// reconcile never reclaims or self-heals a tagged node (§4/§9.4).
+	skipPinReconcile := pak.User == nil || pak.IsTagged() ||
+		(existsSameUser && existingNodeSameUser.Valid() && existingNodeSameUser.IsTagged())
+
+	var pinInfo pinOutcome
+
+	if !skipPinReconcile {
+		var pinReqExpiry *time.Time
+		if !regReq.Expiry.IsZero() {
+			pinReqExpiry = &regReq.Expiry
+		}
+
+		pinInfo = s.tryPinReconcile(all, types.UserID(pak.User.ID), regReq.Hostinfo, newNodeParams{
+			User:           *pak.User,
+			MachineKey:     machineKey,
+			NodeKey:        regReq.NodeKey,
+			DiscoKey:       key.DiscoPublic{}, // DiscoKey not available in RegisterRequest
+			Hostname:       hostname,
+			Hostinfo:       validHostinfo,
+			Endpoints:      nil, // Endpoints not available in RegisterRequest
+			Expiry:         pinReqExpiry,
+			RegisterMethod: util.RegisterMethodAuthKey,
+			PreAuthKey:     pak,
+		})
+		if pinInfo.handled {
+			// RE-PIN recreate already produced the complete result: run the
+			// same policy-manager epilogue as below, but merge into the
+			// reconcile-computed change instead of reauthChange.
+			finalChange := pinInfo.change
+
+			usersChange, err := s.updatePolicyManagerUsers()
+			if err != nil {
+				return pinInfo.node, finalChange, fmt.Errorf("updating policy manager users: %w", err)
+			}
+			if !usersChange.IsEmpty() {
+				finalChange = finalChange.Merge(usersChange)
+			}
+
+			nodesChange, err := s.updatePolicyManagerNodes()
+			if err != nil {
+				return pinInfo.node, finalChange, fmt.Errorf("updating policy manager nodes: %w", err)
+			}
+			if !nodesChange.IsEmpty() {
+				finalChange = finalChange.Merge(nodesChange)
+			}
+
+			return pinInfo.node, finalChange, nil
+		}
+	}
 
 	var finalNode types.NodeView
 
@@ -2740,7 +2935,23 @@ func (s *State) HandleNodeFromPreAuthKey(
 
 	policyChanged := !usersChange.IsEmpty() || !nodesChange.IsEmpty()
 
-	return finalNode, reauthChange(finalNode, existsSameUser, policyChanged), nil
+	// pin-reconcile "newest wins" consolidation (docs/plan-ip-pin-consistency.md
+	// §1/§2/§3): only runs when mode=="on" and reconcile did not already
+	// bypass this function above. A CHEAP/KEEP decision leaves other self
+	// nodes (other users sharing this machineKey) untouched by the normal
+	// path above; this deletes them now that finalNode is confirmed.
+	var extraRemovals []change.Change
+
+	if !skipPinReconcile && s.cfg.DERP.PinReconcileMode == "on" {
+		extraRemovals = s.reconcileDeleteSelf(all, finalNode.ID(), pinInfo.pin, pinInfo.pinOK)
+	}
+
+	finalChange := reauthChange(finalNode, existsSameUser, policyChanged)
+	for _, r := range extraRemovals {
+		finalChange = finalChange.Merge(r)
+	}
+
+	return finalNode, finalChange, nil
 }
 
 // reauthChange returns the [change.Change] to broadcast after an authentication

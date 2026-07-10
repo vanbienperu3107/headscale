@@ -39,6 +39,7 @@ const (
 	rebuildPeerMaps = 4
 	setName         = 5
 	updateMulti     = 6
+	swapNode        = 7
 )
 
 const prometheusNamespace = "headscale"
@@ -186,6 +187,11 @@ type work struct {
 	// prober applying multiple probe results at once) cannot have a
 	// partial snapshot published between the updates.
 	multiUpdates map[types.NodeID]UpdateNodeFunc
+	// For swapNode: the set of node IDs to remove in the same batch
+	// iteration that inserts node/nodeID, so no intermediate snapshot is
+	// ever published showing both an old holder and its replacement (see
+	// [NodeStore.SwapNode]).
+	deleteIDs []types.NodeID
 }
 
 // PutNode adds or updates a node in the store.
@@ -312,6 +318,55 @@ func (s *NodeStore) DeleteNode(id types.NodeID) {
 	nodeStoreQueueDepth.Dec()
 
 	nodeStoreOperations.WithLabelValues("delete").Inc()
+}
+
+// SwapNode atomically removes every node in deleteIDs and inserts newNode,
+// as a single [NodeStore.applyBatch] iteration producing exactly one
+// snapshot swap. This is the primitive the pin-reconcile "recreate" path
+// (docs/plan-ip-pin-consistency.md §2/§3, H5) uses to replace one or more
+// drifted self nodes with a freshly-created node pinned to a specific IP:
+// unlike a [NodeStore.DeleteNode] followed by [NodeStore.PutNode] (two
+// independent snapshot swaps), no reader can ever observe an intermediate
+// snapshot where both an old holder of the pinned address and its
+// replacement are present, nor one where the machine has zero nodes.
+//
+// newNode.ID must already be assigned (i.e. the caller already persisted it
+// to the database and knows its ID) — SwapNode only maintains the in-memory
+// index, mirroring [NodeStore.PutNode].
+//
+// Returns the resulting [types.NodeView] for newNode (Valid()==false if the
+// store was stopped before the write completed).
+func (s *NodeStore) SwapNode(deleteIDs []types.NodeID, newNode types.Node) types.NodeView {
+	timer := prometheus.NewTimer(nodeStoreOperationDuration.WithLabelValues("swap_node"))
+	defer timer.ObserveDuration()
+
+	work := work{
+		op:         swapNode,
+		nodeID:     newNode.ID,
+		node:       newNode,
+		deleteIDs:  deleteIDs,
+		result:     make(chan struct{}),
+		nodeResult: make(chan types.NodeView, 1),
+	}
+
+	nodeStoreQueueDepth.Inc()
+
+	select {
+	case s.writeQueue <- work:
+	case <-s.stopped:
+		nodeStoreQueueDepth.Dec()
+
+		return types.NodeView{}
+	}
+
+	<-work.result
+	nodeStoreQueueDepth.Dec()
+
+	resultNode := <-work.nodeResult
+
+	nodeStoreOperations.WithLabelValues("swap_node").Inc()
+
+	return resultNode
 }
 
 // SetGivenName sets [types.Node.GivenName] on the node identified by id,
@@ -475,6 +530,21 @@ func (s *NodeStore) applyBatch(batch []work) {
 		case del:
 			delete(nodes, w.nodeID)
 			// For delete operations, send an invalid NodeView if requested
+			if w.nodeResult != nil {
+				nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
+			}
+		case swapNode:
+			// Delete first so the new node's GivenName resolution below
+			// (and any future index-collision check) never sees a stale
+			// holder still occupying the slot being vacated.
+			for _, id := range w.deleteIDs {
+				delete(nodes, id)
+			}
+
+			n := w.node
+			n.GivenName = resolveGivenName(nodes, n.ID, n.GivenName)
+
+			nodes[w.nodeID] = n
 			if w.nodeResult != nil {
 				nodeResultRequests[w.nodeID] = append(nodeResultRequests[w.nodeID], w)
 			}
